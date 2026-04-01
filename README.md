@@ -4,6 +4,8 @@ Converts Cerebras simulator CTF traces into [speedscope](https://www.speedscope.
 
 Parses barectf-generated CTF streams and ELF symbol tables to reconstruct per-tile function call stacks and task timelines. Supports WSE-2 and WSE-3.
 
+![simtracer example](media/simtracer.gif)
+
 ## Install
 
 ```
