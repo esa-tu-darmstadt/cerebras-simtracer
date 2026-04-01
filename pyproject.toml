@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simtracer"
+version = "0.1.0"
+description = "Convert Cerebras simulator CTF traces to speedscope profiles"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = ["pyelftools", "tqdm"]
+authors = [
+    {name = "Tim Noack", email = "noack@esa.tu-darmstadt.de"},
+]
+
+[project.scripts]
+simtracer = "simtracer:main"
