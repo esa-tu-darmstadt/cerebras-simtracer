@@ -14,5 +14,8 @@ authors = [
     {name = "Tim Noack", email = "noack@esa.tu-darmstadt.de"},
 ]
 
+[tool.setuptools]
+py-modules = ["simtracer"]
+
 [project.scripts]
 simtracer = "simtracer:main"
