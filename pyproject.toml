@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simtracer"
-version = "0.1.0"
-description = "Convert Cerebras simulator CTF traces to speedscope profiles"
+version = "0.2.0"
+description = "Tools for inspecting Cerebras simulator CTF traces"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -15,7 +15,8 @@ authors = [
 ]
 
 [tool.setuptools]
-py-modules = ["simtracer"]
+py-modules = ["ctf", "simflame", "simtrace"]
 
 [project.scripts]
-simtracer = "simtracer:main"
+simflame = "simflame:main"
+simtrace = "simtrace:main"
