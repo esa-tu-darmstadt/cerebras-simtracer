@@ -35,6 +35,7 @@ from tqdm import tqdm
 from ctf import (
     DispatchEvent,
     PipeEvent,
+    WaveletEvent,
     PIPE_WRITEBACK_STAGE,
     PIPE_NO_VALUE_U32,
     PIPE_NO_VALUE_U8,
@@ -229,7 +230,8 @@ def setup_context(args):
     elf_lookups, _arch = load_all_elf_lookups(bin_root, verbose=args.verbose)
     if not elf_lookups:
         raise SystemExit("No ELF files with function symbols found")
-    tile_elf_mapping = build_elf_mapping(elf_lookups, grid_width, verbose=args.verbose)
+    tile_elf_mapping = build_elf_mapping(elf_lookups, grid_width,
+                                         verbose=args.verbose, quiet=args.quiet)
     return Context(
         out_dir=args.out_dir, trace_dir=trace_dir,
         grid_width=grid_width, grid_height=grid_height,
@@ -246,11 +248,12 @@ def cmd_tiles(args, ctx):
     """List tiles that appear in the trace (with their ELF and event count)."""
     sp = stream0_path(ctx.trace_dir)
     counts = Counter()
-    pbar = tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
-                desc="scanning", file=sys.stderr)
+    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+                 desc="scanning", file=sys.stderr) if not args.quiet else None)
     for evt in parse_ctf_stream(sp, progress=pbar):
         counts[evt.tile_index] += 1
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
 
     print(f"Available tiles (grid {ctx.grid_width}x{ctx.grid_height}):")
     print(f"  {'tile':>5}  {'coord':<7} {'events':>10}  ELF")
@@ -377,8 +380,8 @@ def cmd_find(args, ctx):
         print(f"  {f.name}  @ 0x{f.start:06x}  (size {f.size})", file=sys.stderr)
 
     sp = stream0_path(ctx.trace_dir)
-    pbar = tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
-                desc="scanning", file=sys.stderr)
+    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+                 desc="scanning", file=sys.stderr) if not args.quiet else None)
 
     print(f"{'cycle':>10}  {'task':>4}  function  (uid)")
     last_func_per_cycle = None
@@ -392,7 +395,8 @@ def cmd_find(args, ctx):
             hit_count += 1
             if args.limit and hit_count >= args.limit:
                 break
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
     print(f"Total entries: {hit_count}", file=sys.stderr)
 
 
@@ -510,6 +514,45 @@ def cmd_regs(args, ctx):
 #  Subcommand: funcs
 # --------------------------------------------------------------------------- #
 
+def cmd_wavelets(args, ctx):
+    """Show wavelet send/receive events for a tile (color + data + cycle)."""
+    tile = resolve_tile(args.tile, ctx.grid_width)
+    pe_x = tile % ctx.grid_width
+    pe_y = tile // ctx.grid_width
+    cyc_range = parse_cycle_range(args.cycles)
+
+    colors = None
+    if args.colors:
+        colors = set(int(c, 0) for c in args.colors.split(","))
+
+    sp = stream0_path(ctx.trace_dir)
+    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+                 desc="scanning", file=sys.stderr) if not args.quiet else None)
+
+    print(f"# tile P{pe_x}.{pe_y} (PE_x={pe_x}, PE_y={pe_y})")
+    print(f"{'cycle':>10}  {'color':>5}  {'ctrl':>4}  {'half':>4}  "
+          f"{'cnt':>4}  {'idx':>4}  {'data':>6}  {'ev':>3}")
+
+    count = 0
+    for evt in parse_ctf_stream(sp, progress=pbar, yield_wavelets=True,
+                                pe_filter={(pe_x, pe_y)},
+                                cycle_range=cyc_range):
+        if not isinstance(evt, WaveletEvent):
+            continue
+        if colors is not None and evt.color not in colors:
+            continue
+        print(f"{evt.cycle:>10}  {evt.color:>5}  {evt.ctrlbit:>4}  "
+              f"{evt.half_wavelet:>4}  {evt.wvlt_cnt:>4}  {evt.wvlt_idx:>4}  "
+              f"0x{evt.wvlt_data:04x}  {evt.event_type:>3}")
+        count += 1
+        if args.limit and count >= args.limit:
+            break
+
+    if pbar is not None:
+        pbar.close()
+    print(f"# {count} wavelet event(s)", file=sys.stderr)
+
+
 def cmd_funcs(args, ctx):
     """List functions known in the ELF for a given tile (optionally matching a pattern)."""
     tile = resolve_tile(args.tile, ctx.grid_width)
@@ -595,6 +638,16 @@ def build_argparser():
     p.add_argument("--tile", required=True, help="Tile index N or 'x.y' coord")
     p.add_argument("--pattern", help="Filter by substring or fnmatch pattern")
     p.set_defaults(handler=cmd_funcs)
+
+    p = sub.add_parser("wavelets",
+                       help="Show wavelet send/receive events for a tile")
+    p.add_argument("--tile", required=True, help="Tile index N or 'x.y' coord")
+    p.add_argument("--cycles", help="Restrict to cycle range A:B")
+    p.add_argument("--colors",
+                   help="Filter to specific color(s), comma-separated (decimal or 0x...)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Stop after N matching events (0 = no limit)")
+    p.set_defaults(handler=cmd_wavelets)
 
     return parser
 

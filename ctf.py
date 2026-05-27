@@ -159,7 +159,7 @@ class SymbolLookup:
 #  Tile -> ELF mapping via LMA
 # --------------------------------------------------------------------------- #
 
-def build_elf_mapping(elf_lookups, grid_width, verbose=False):
+def build_elf_mapping(elf_lookups, grid_width, verbose=False, quiet=False):
     """
     Build tile_index -> elf_path mapping from ELF PT_LOAD segment LMAs.
 
@@ -193,7 +193,8 @@ def build_elf_mapping(elf_lookups, grid_width, verbose=False):
             print(f"  {elf_name}: {len(tile_indices)} tile(s), "
                   f"first = tile {min(tile_indices)} (P{x}.{y})", file=sys.stderr)
 
-    print(f"Mapped {len(mapping)} tiles from LMA segments", file=sys.stderr)
+    if not quiet:
+        print(f"Mapped {len(mapping)} tiles from LMA segments", file=sys.stderr)
     return mapping
 
 
@@ -285,6 +286,31 @@ class DispatchEvent:
 
 
 @dataclass
+class WaveletEvent:
+    """wavelet_entry (event id=5): per-wavelet send/receive event on a PE.
+
+    Emitted by the simulator whenever a wavelet crosses a fabric interface.
+    `event_type` distinguishes send vs receive (and other variants); exact enum
+    values are not documented in the metadata — print and infer from context.
+
+    `cycle` is the simulator clock at the event (same scale as
+    `DispatchEvent.cycle`, so the two streams can be merged for correlation).
+    The CTF field is named "timestamp" — that's a misnomer; values appear in
+    simulated cycles, matching what the Cerebras profiler GUI displays.
+    """
+    cycle: int          # simulator cycle (CTF metadata calls this `timestamp`)
+    pe_x: int
+    pe_y: int
+    color: int
+    ctrlbit: int
+    half_wavelet: int
+    wvlt_cnt: int
+    wvlt_idx: int
+    wvlt_data: int
+    event_type: int
+
+
+@dataclass
 class PipeEvent:
     """hwm_pipe_trace_entry (event id=3): per-pipeline-stage operand snapshot.
 
@@ -310,20 +336,29 @@ class PipeEvent:
 # --------------------------------------------------------------------------- #
 
 def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
-                     yield_pipe=False, cycle_range=None):
+                     yield_pipe=False, cycle_range=None,
+                     yield_wavelets=False, pe_filter=None):
     """
     Parse CTF stream file and yield event objects.
 
     Always yields DispatchEvent (id=2). When yield_pipe is True, also yields
-    PipeEvent (id=3). Both event types are emitted in trace order.
+    PipeEvent (id=3). When yield_wavelets is True, also yields WaveletEvent
+    (id=5). All event types are emitted in trace order.
 
     Args:
         stream_path: path to stream0 file
-        tile_filter: set of tile indices to keep, or None for all
+        tile_filter: set of tile indices to keep (applies to DispatchEvent and
+            PipeEvent, which carry tile_index), or None for all
         progress: optional tqdm instance updated with bytes consumed
         yield_pipe: also yield PipeEvent records
         cycle_range: optional (start, end) — yields events with start <= cycle < end.
                      end may be None (open-ended); stops streaming once we pass end.
+                     Applies to all event types that carry a `cycle` field
+                     (dispatch, pipe, wavelet — wavelet's `timestamp` is actually
+                     a cycle, see WaveletEvent docstring).
+        yield_wavelets: also yield WaveletEvent records
+        pe_filter: set of (pe_x, pe_y) tuples to keep for WaveletEvent, or None
+            for all. Has no effect on DispatchEvent / PipeEvent.
     """
     cyc_start = cycle_range[0] if cycle_range else None
     cyc_end = cycle_range[1] if cycle_range else None
@@ -372,7 +407,7 @@ def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
                     try:
                         evt_offset = _skip_or_parse_event(
                             data, pkt_start, evt_offset, evt_id, tile_filter,
-                            yield_pipe,
+                            yield_pipe, yield_wavelets, pe_filter,
                         )
                     except (struct.error, IndexError, ValueError):
                         evt_offset = content_end
@@ -404,7 +439,7 @@ def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
 
 
 def _skip_or_parse_event(data, pkt_start, offset, evt_id, tile_filter,
-                         yield_pipe):
+                         yield_pipe, yield_wavelets=False, pe_filter=None):
     """
     Parse or skip one event. Returns the new offset, or (Event, new_offset)
     for events that pass the tile filter.
@@ -489,10 +524,33 @@ def _skip_or_parse_event(data, pkt_start, offset, evt_id, tile_filter,
 
     elif evt_id == 5:  # wavelet_entry
         off = _align(offset, 16)
-        off += 2 + 2 + 2 + 1 + 1
+        if not yield_wavelets:
+            off += 2 + 2 + 2 + 1 + 1
+            off = _align(off, 64)
+            off += 8 + 2 + 2 + 2 + 2
+            return off
+        pe_x = struct.unpack_from("<H", data, off)[0]; off += 2
+        pe_y = struct.unpack_from("<H", data, off)[0]; off += 2
+        color = struct.unpack_from("<H", data, off)[0]; off += 2
+        ctrlbit = struct.unpack_from("<b", data, off)[0]; off += 1
+        half_wavelet = struct.unpack_from("<b", data, off)[0]; off += 1
         off = _align(off, 64)
-        off += 8 + 2 + 2 + 2 + 2
-        return off
+        cycle = struct.unpack_from("<Q", data, off)[0]; off += 8
+        wvlt_cnt = struct.unpack_from("<H", data, off)[0]; off += 2
+        wvlt_idx = struct.unpack_from("<H", data, off)[0]; off += 2
+        wvlt_data = struct.unpack_from("<H", data, off)[0]; off += 2
+        event_type = struct.unpack_from("<H", data, off)[0]; off += 2
+
+        if pe_filter is not None and (pe_x, pe_y) not in pe_filter:
+            return off
+
+        event = WaveletEvent(
+            cycle=cycle, pe_x=pe_x, pe_y=pe_y, color=color,
+            ctrlbit=ctrlbit, half_wavelet=half_wavelet,
+            wvlt_cnt=wvlt_cnt, wvlt_idx=wvlt_idx, wvlt_data=wvlt_data,
+            event_type=event_type,
+        )
+        return (event, off)
 
     elif evt_id == 6:  # wavelet_trace_entry
         off = _align(offset, 64)
