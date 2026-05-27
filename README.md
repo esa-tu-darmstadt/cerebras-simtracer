@@ -1,11 +1,12 @@
 # Cerebras simtracer
 
-Tools for inspecting Cerebras simulator CTF traces. Two complementary commands:
+Tools for inspecting Cerebras simulator CTF traces. Three complementary commands:
 
 - **`simflame`** — converts a trace into a [speedscope](https://www.speedscope.app/) flamegraph for whole-program / multi-tile call-stack visualization.
+- **`simperfetto`** — converts a trace into a [Perfetto](https://ui.perfetto.dev) protobuf trace: the same flamegraph plus configurable counter/instant channels (dispatch & wavelet rates, fabric backpressure, wavelets, router state, operands).
 - **`simtrace`** — interactive per-PE instruction trace viewer: cycle ranges, function-entry hits, per-task / per-mnemonic stats, and resolved operand values from the pipeline trace.
 
-Both share a CTF parser (`ctf.py`) and an ELF symbol cache.
+They share a metadata-driven CTF parser (`ctf.py`), the call-stack reconstruction (`callstack.py`), and an ELF symbol cache.
 
 ## Install
 
@@ -28,6 +29,36 @@ simflame <out_dir> -o trace.speedscope.json [--tiles 16,17,18] [--trace-dir DIR]
 Open the output in https://www.speedscope.app/.
 
 ![simflame example](media/simtracer.gif)
+
+## simperfetto — Perfetto trace with extra channels
+
+```
+simperfetto <out_dir> -o trace.pftrace [--tiles 16,17] [--cycles A:B] [--all]
+```
+
+Open the output at https://ui.perfetto.dev (use a `.pftrace.gz` output name to gzip it). Each tile becomes a process group; channels add tracks under it. The same options as `simflame` apply (`--tiles`, `--trace-dir`, `--bin-root`), plus `--cycles A:B` and `--bin-cycles N` (counter window, default 1000).
+
+Timestamps are simulator **cycles** written directly — the Perfetto axis labels them "ns", but 1 tick = 1 cycle.
+
+### Channels
+
+| channel | flag | default | track(s) per tile |
+| --- | --- | --- | --- |
+| Call-stack flamegraph | `--calls` / `--no-calls` | on | `calls` (slices) |
+| Dispatch rate | `--dispatch-rate` / `--no-` | on | `dispatch/bin` (counter) |
+| Wavelet rate | `--wavelet-rate` / `--no-` | on | `wavelets/bin` (counter) |
+| Fabric backpressure | `--backpressure` / `--no-` | on | `backpressure L<link>` (counter, binned max) |
+| — full-resolution backpressure | `--backpressure-raw` | off | every sample instead of the binned max |
+| Per-wavelet markers | `--wavelet-events` / `--no-` | on | `wavelets` (instant; id=5 and id=6) |
+| Wavelet flow arrows | `--flow` / `--no-flow` | on | links each wavelet's hops by ident (id=6) / color (id=5) |
+| Router switch position | `--switch-pos` | off | `router` (instant) |
+| Resolved operands | `--regs` | off | `reg.dest/src0/src1/src2` (counters) |
+| Debug wavelet counters | `--debug-counters` | off | `dbg.count_w/t/s c<color>` (counters) |
+| Everything | `--all` | — | enables the remaining opt-in channels (except `--backpressure-raw`) |
+
+`--flow` keys the flow id on the wavelet's full 64-bit `ident` (id=6) or color (id=5), so a wavelet forwarded across the fabric — a "train" — shows as a connected chain of arrows. Click a wavelet marker in the Perfetto UI to highlight its train. Needs `--wavelet-events` (the markers the arrows attach to).
+
+The defaults are a cheap, low-clutter set. Backpressure dominates a typical trace (millions of samples), so it is downsampled to a per-window max envelope by default; `--backpressure-raw` emits every sample (much larger output). Which event types a given trace actually contains varies — channels with no matching events simply produce no tracks.
 
 ## simtrace — per-PE instruction trace viewer
 
@@ -102,10 +133,23 @@ Instruction mnemonics (top 5):
 
 ## CTF event mapping
 
-`simtrace` uses two CTF event types from the simulator:
+`ctf.py` reads the field layout of every event from the trace's CTF `metadata`
+file (barectf format) and decodes by name, so it is not tied to hand-coded
+offsets. The simulator emits these event types (not all appear in every trace):
 
-- **`hwm_dispatch_trace_entry`** (id 2) — one record per dispatched instruction; carries `cycle`, `inst_ptr` (word address), `inst_bin` (raw bytes), `task_color`, `term_op`, and the mnemonic. This is the same source `simflame` uses.
-- **`hwm_pipe_trace_entry`** (id 3) — several records per dispatched instruction, one per pipeline stage. Stage 6 (writeback) carries the resolved operand values (`dest`, `src0`, `src1`, `src2`). Earlier stages contain `0xFFFFFFFF` sentinels and are ignored. The `uid` field links these back to the dispatch event.
+| id | event | used by | key fields |
+| --- | --- | --- | --- |
+| 0 | `backpressure_trace_entry` | simperfetto | `cycle`, `tile_index`, `back_pressure` (level), `link` |
+| 1 | `debug_counters_wavelet` | simperfetto | `PE_x/y`, `color`, `count_w/t/s` |
+| 2 | `hwm_dispatch_trace_entry` | all | `cycle`, `inst_ptr` (word addr), `inst_bin`, `task_color`, `term_op`, mnemonic |
+| 3 | `hwm_pipe_trace_entry` | simtrace, simperfetto | `uid`, `dest/src0/src1/src2` (stage 6 only) |
+| 4 | `switch_pos_trace_entry` | simperfetto | `tile_index`, `color`, `input/output_pos/mask` |
+| 5 | `wavelet_entry` | simtrace, simperfetto | `PE_x/y`, `color`, `wvlt_cnt/idx/data`, `event_type` |
+| 6 | `wavelet_trace_entry` | simperfetto | `cycle`, `ident`, `tile_index`, `index`, `data`, `fields` |
+
+- **id 2** (dispatch) is the source for the flamegraph and `simtrace`'s instruction views.
+- **id 3** (pipe) emits several records per instruction, one per pipeline stage; only **stage 6** (writeback) carries resolved operand values (`dest`, `src0`, `src1`, `src2`) — earlier stages are `0xFFFFFFFF` sentinels. `uid` links a pipe record back to its dispatch.
+- **wavelets** come as either id 5 (`wavelet_entry`) or id 6 (`wavelet_trace_entry`) depending on the simulator build; `simperfetto` handles both, while `simtrace wavelets` covers id 5.
 
 ## Notes
 

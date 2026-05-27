@@ -180,9 +180,10 @@ def collect_tile_trace(trace_dir, tile_index, *, cycle_range=None,
     dispatch = []
     pipe_by_uid = {}
 
+    want_ids = (2, 3) if want_pipe else (2,)
     for evt in parse_ctf_stream(
-        sp, tile_filter={tile_index}, progress=pbar,
-        yield_pipe=want_pipe, cycle_range=cycle_range,
+        sp, want_ids=want_ids, tile_filter={tile_index}, progress=pbar,
+        cycle_range=cycle_range,
     ):
         if isinstance(evt, DispatchEvent):
             dispatch.append(evt)
@@ -534,7 +535,7 @@ def cmd_wavelets(args, ctx):
           f"{'cnt':>4}  {'idx':>4}  {'data':>6}  {'ev':>3}")
 
     count = 0
-    for evt in parse_ctf_stream(sp, progress=pbar, yield_wavelets=True,
+    for evt in parse_ctf_stream(sp, want_ids=(5,), progress=pbar,
                                 pe_filter={(pe_x, pe_y)},
                                 cycle_range=cyc_range):
         if not isinstance(evt, WaveletEvent):

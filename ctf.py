@@ -10,6 +10,7 @@ stages contain 0xFFFFFFFF sentinels).
 
 import bisect
 import os
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -331,35 +332,256 @@ class PipeEvent:
     cflag: int
 
 
+@dataclass
+class BackpressureEvent:
+    """backpressure_trace_entry (event id=0): per-link fabric backpressure level.
+
+    By far the most frequent event in a typical trace. `back_pressure` is a
+    level (not a rate); `link` selects which fabric link/queue on the tile.
+    """
+    cycle: int
+    tile_index: int
+    back_pressure: int
+    link: int
+
+
+@dataclass
+class DebugCountersEvent:
+    """debug_counters_wavelet (event id=1): cumulative per-(PE, color) counts.
+
+    Has no `cycle` field in the trace; `cycle` is taken from the CTF event
+    header timestamp.
+    """
+    cycle: int
+    pe_x: int
+    pe_y: int
+    color: int
+    count_w: int
+    count_t: int
+    count_s: int
+
+
+@dataclass
+class SwitchPosEvent:
+    """switch_pos_trace_entry (event id=4): router switch configuration."""
+    cycle: int
+    tile_index: int
+    color: int
+    input_pos: int
+    input_mask: int
+    output_pos: int
+    output_mask: int
+
+
+@dataclass
+class WaveletTraceEvent:
+    """wavelet_trace_entry (event id=6): per-wavelet fabric event.
+
+    The wavelet stream emitted by these simulator builds (distinct from the
+    id=5 `wavelet_entry`). `ident` is a packed wavelet/route identifier; `data`
+    is the 16-bit payload; `fields` is a packed control word.
+    """
+    cycle: int
+    ident: int
+    tile_index: int
+    index: int
+    data: int
+    fields: int
+
+
+@dataclass
+class Event:
+    """Generic fallback for event ids without a dedicated dataclass."""
+    id: int
+    name: str
+    cycle: int
+    fields: dict
+
+
+# --------------------------------------------------------------------------- #
+#  CTF metadata schema (barectf 1.8 text format)
+# --------------------------------------------------------------------------- #
+
+# struct fmt char for an (size_bits, signed) integer.
+_INT_FMT = {
+    (8, False): "B", (8, True): "b",
+    (16, False): "H", (16, True): "h",
+    (32, False): "I", (32, True): "i",
+    (64, False): "Q", (64, True): "q",
+}
+
+
+@dataclass
+class FieldSpec:
+    name: str
+    is_str: bool
+    fmt: str      # struct format char, "" for strings
+    nbytes: int   # 0 for strings
+    align: int    # alignment in bits
+
+
+class EventType:
+    """A trace event's name + ordered field layout, with decode/skip."""
+
+    def __init__(self, eid, name, fields):
+        self.id = eid
+        self.name = name
+        self.fields = fields
+
+    def decode(self, data, pkt_start, offset):
+        """Return (values dict, new offset)."""
+        vals = {}
+        off = offset
+        for f in self.fields:
+            off = align_up(off - pkt_start, f.align) + pkt_start
+            if f.is_str:
+                end = data.index(b"\x00", off)
+                vals[f.name] = data[off:end].decode("utf-8", errors="replace")
+                off = end + 1
+            else:
+                vals[f.name] = struct.unpack_from("<" + f.fmt, data, off)[0]
+                off += f.nbytes
+        return vals, off
+
+    def skip(self, data, pkt_start, offset):
+        """Advance past this event without materializing field values."""
+        off = offset
+        for f in self.fields:
+            off = align_up(off - pkt_start, f.align) + pkt_start
+            if f.is_str:
+                off = data.index(b"\x00", off) + 1
+            else:
+                off += f.nbytes
+        return off
+
+
+_BLOCK_KEYWORD = "event {"
+_FIELD_RE = re.compile(
+    r"(?:integer\s*\{(?P<props>[^}]*)\}|string\s*\{[^}]*\})\s*(?P<name>\w+)\s*;")
+_ID_RE = re.compile(r"(?m)^\s*id\s*=\s*(\d+)\s*;")
+_NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"')
+
+
+def _iter_event_blocks(text):
+    """Yield the brace-delimited body of each top-level `event { ... }` block."""
+    i = 0
+    while True:
+        j = text.find(_BLOCK_KEYWORD, i)
+        if j < 0:
+            return
+        k = text.find("{", j)
+        depth = 0
+        m = k
+        while m < len(text):
+            if text[m] == "{":
+                depth += 1
+            elif text[m] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            m += 1
+        yield text[k + 1:m]
+        i = m + 1
+
+
+def parse_metadata(metadata_path):
+    """Parse a barectf CTF metadata file into {event_id: EventType}."""
+    with open(metadata_path) as f:
+        text = f.read()
+    schema = {}
+    for block in _iter_event_blocks(text):
+        eid = int(_ID_RE.search(block).group(1))
+        name = _NAME_RE.search(block).group(1)
+        fields = []
+        for m in _FIELD_RE.finditer(block):
+            props = m.group("props")
+            if props is None:  # string field
+                fields.append(FieldSpec(m.group("name"), True, "", 0, 8))
+            else:
+                signed = "signed = true" in props
+                size = int(re.search(r"size\s*=\s*(\d+)", props).group(1))
+                align = int(re.search(r"align\s*=\s*(\d+)", props).group(1))
+                fields.append(FieldSpec(m.group("name"), False,
+                                        _INT_FMT[(size, signed)], size // 8, align))
+        schema[eid] = EventType(eid, name, fields)
+    return schema
+
+
+def _build_event(eid, name, vals, cycle):
+    """Map a decoded field dict onto a typed event (generic Event otherwise)."""
+    if eid == 2:
+        return DispatchEvent(
+            cycle=cycle, tile_index=vals["tile_index"], inst_ptr=vals["inst_ptr"],
+            inst_bin=vals["inst_bin"], term_op=vals["term_op"],
+            task_color=vals["task_color"], name=vals["name"], uid=vals["uid"])
+    if eid == 3:
+        return PipeEvent(
+            cycle=cycle, tile_index=vals["tile_index"], uid=vals["uid"],
+            data=vals["data"], dest=vals["dest"], src0=vals["src0"],
+            src1=vals["src1"], src2=vals["src2"], stage=vals["stage"],
+            imm=vals["imm"], cflag=vals["cflag"])
+    if eid == 5:
+        return WaveletEvent(
+            cycle=cycle, pe_x=vals["PE_x"], pe_y=vals["PE_y"], color=vals["color"],
+            ctrlbit=vals["ctrlbit"], half_wavelet=vals["half_wavelet"],
+            wvlt_cnt=vals["wvlt_cnt"], wvlt_idx=vals["wvlt_idx"],
+            wvlt_data=vals["wvlt_data"], event_type=vals["event_type"])
+    if eid == 0:
+        return BackpressureEvent(
+            cycle=cycle, tile_index=vals["tile_index"],
+            back_pressure=vals["back_pressure"], link=vals["link"])
+    if eid == 1:
+        return DebugCountersEvent(
+            cycle=cycle, pe_x=vals["PE_x"], pe_y=vals["PE_y"], color=vals["color"],
+            count_w=vals["count_w"], count_t=vals["count_t"], count_s=vals["count_s"])
+    if eid == 4:
+        return SwitchPosEvent(
+            cycle=cycle, tile_index=vals["tile_index"], color=vals["color"],
+            input_pos=vals["input_pos"], input_mask=vals["input_mask"],
+            output_pos=vals["output_pos"], output_mask=vals["output_mask"])
+    if eid == 6:
+        return WaveletTraceEvent(
+            cycle=cycle, ident=vals["ident"], tile_index=vals["tile_index"],
+            index=vals["index"], data=vals["data"], fields=vals["fields"])
+    return Event(id=eid, name=name, cycle=cycle, fields=vals)
+
+
 # --------------------------------------------------------------------------- #
 #  CTF stream parser
 # --------------------------------------------------------------------------- #
 
-def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
-                     yield_pipe=False, cycle_range=None,
-                     yield_wavelets=False, pe_filter=None):
+def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
+                     pe_filter=None, cycle_range=None, progress=None,
+                     metadata_path=None):
     """
-    Parse CTF stream file and yield event objects.
+    Parse a CTF stream file and yield typed event objects in trace order.
 
-    Always yields DispatchEvent (id=2). When yield_pipe is True, also yields
-    PipeEvent (id=3). When yield_wavelets is True, also yields WaveletEvent
-    (id=5). All event types are emitted in trace order.
+    The per-event field layout is read from the trace's CTF metadata file, so
+    any event the schema describes can be decoded. Each yielded event is a
+    typed dataclass for the known ids (see `_build_event`) or a generic `Event`
+    otherwise.
 
     Args:
-        stream_path: path to stream0 file
-        tile_filter: set of tile indices to keep (applies to DispatchEvent and
-            PipeEvent, which carry tile_index), or None for all
-        progress: optional tqdm instance updated with bytes consumed
-        yield_pipe: also yield PipeEvent records
-        cycle_range: optional (start, end) — yields events with start <= cycle < end.
-                     end may be None (open-ended); stops streaming once we pass end.
-                     Applies to all event types that carry a `cycle` field
-                     (dispatch, pipe, wavelet — wavelet's `timestamp` is actually
-                     a cycle, see WaveletEvent docstring).
-        yield_wavelets: also yield WaveletEvent records
-        pe_filter: set of (pe_x, pe_y) tuples to keep for WaveletEvent, or None
-            for all. Has no effect on DispatchEvent / PipeEvent.
+        stream_path: path to stream0.
+        want_ids: iterable of event ids to decode and yield (default: dispatch
+            only, id=2). Events whose id is not requested are skipped cheaply.
+        tile_filter: set of tile indices to keep (applies to events carrying a
+            `tile_index` field), or None for all.
+        pe_filter: set of (PE_x, PE_y) tuples to keep (applies to events
+            carrying PE_x/PE_y, e.g. id=5 wavelet), or None for all.
+        cycle_range: optional (start, end) — yields events with
+            start <= cycle < end. `end` may be None (open-ended); streaming
+            stops once we pass `end`. The cycle comes from the event's `cycle`
+            field, else its `timestamp` field, else the CTF header timestamp.
+        progress: optional tqdm instance updated with bytes consumed.
+        metadata_path: path to the CTF metadata; defaults to a file named
+            `metadata` next to `stream_path`.
     """
+    if metadata_path is None:
+        metadata_path = os.path.join(os.path.dirname(stream_path), "metadata")
+    schema = parse_metadata(metadata_path)
+    want = set(want_ids)
+
     cyc_start = cycle_range[0] if cycle_range else None
     cyc_end = cycle_range[1] if cycle_range else None
 
@@ -401,26 +623,39 @@ def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
                 # skip whole packets outside cycle_range, but cycles and CTF
                 # timestamps are not the same scale; rely on per-event filter.
                 while evt_offset + EVT_HDR.size <= content_end:
-                    evt_id, _evt_ts = EVT_HDR.unpack_from(data, evt_offset)
+                    evt_id, evt_ts = EVT_HDR.unpack_from(data, evt_offset)
                     evt_offset += EVT_HDR.size
 
+                    et = schema.get(evt_id)
+                    if et is None:
+                        evt_offset = content_end  # unknown layout — bail packet
+                        break
                     try:
-                        evt_offset = _skip_or_parse_event(
-                            data, pkt_start, evt_offset, evt_id, tile_filter,
-                            yield_pipe, yield_wavelets, pe_filter,
-                        )
+                        if evt_id not in want:
+                            evt_offset = et.skip(data, pkt_start, evt_offset)
+                            continue
+                        vals, evt_offset = et.decode(data, pkt_start, evt_offset)
                     except (struct.error, IndexError, ValueError):
                         evt_offset = content_end
                         break
 
-                    if isinstance(evt_offset, tuple):
-                        event, evt_offset = evt_offset
-                        if cyc_start is not None and event.cycle < cyc_start:
-                            continue
-                        if cyc_end is not None and event.cycle >= cyc_end:
-                            stopped = True
-                            break
-                        yield event
+                    tile = vals.get("tile_index")
+                    if tile_filter is not None and tile is not None and tile not in tile_filter:
+                        continue
+                    if pe_filter is not None and "PE_x" in vals \
+                            and (vals["PE_x"], vals["PE_y"]) not in pe_filter:
+                        continue
+
+                    cycle = vals.get("cycle")
+                    if cycle is None:
+                        cycle = vals.get("timestamp", evt_ts)
+                    if cyc_start is not None and cycle < cyc_start:
+                        continue
+                    if cyc_end is not None and cycle >= cyc_end:
+                        stopped = True
+                        break
+
+                    yield _build_event(evt_id, et.name, vals, cycle)
 
                 offset = pkt_start + pkt_size
 
@@ -436,131 +671,6 @@ def parse_ctf_stream(stream_path, tile_filter=None, progress=None,
 
         if progress is not None:
             progress.update(file_size - abs_pos)
-
-
-def _skip_or_parse_event(data, pkt_start, offset, evt_id, tile_filter,
-                         yield_pipe, yield_wavelets=False, pe_filter=None):
-    """
-    Parse or skip one event. Returns the new offset, or (Event, new_offset)
-    for events that pass the tile filter.
-    """
-    def _align(off, bits):
-        return align_up(off - pkt_start, bits) + pkt_start
-
-    if evt_id == 0:  # backpressure_trace_entry
-        off = _align(offset, 64)
-        off += 8 + 4 + 4 + 1
-        return off
-
-    elif evt_id == 1:  # debug_counters_wavelet
-        off = _align(offset, 32)
-        off += 4 + 4 + 4
-        off = _align(off, 64)
-        off += 8 + 8 + 8
-        return off
-
-    elif evt_id == 2:  # hwm_dispatch_trace_entry
-        off = _align(offset, 64)
-        cycle = struct.unpack_from("<Q", data, off)[0]; off += 8
-        tile_index = struct.unpack_from("<I", data, off)[0]; off += 4
-
-        if tile_filter is not None and tile_index not in tile_filter:
-            off += 4 + 4 + 4 + 4 + 2 + 1 + 1 + 1
-            end = data.index(b'\x00', off)
-            return end + 1
-
-        uid = struct.unpack_from("<I", data, off)[0]; off += 4
-        inst_bin = struct.unpack_from("<I", data, off)[0]; off += 4
-        off += 4 + 4  # num_data + context
-        inst_ptr = struct.unpack_from("<H", data, off)[0]; off += 2
-        task_color = data[off]; off += 1
-        off += 1  # ut_id
-        term_op = struct.unpack_from("<b", data, off)[0]; off += 1
-        end = data.index(b'\x00', off)
-        name = data[off:end].decode('utf-8', errors='replace')
-        off = end + 1
-
-        event = DispatchEvent(
-            cycle=cycle, tile_index=tile_index, inst_ptr=inst_ptr,
-            inst_bin=inst_bin, term_op=term_op, task_color=task_color,
-            name=name, uid=uid,
-        )
-        return (event, off)
-
-    elif evt_id == 3:  # hwm_pipe_trace_entry
-        off = _align(offset, 64)
-        if not yield_pipe:
-            off += 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1
-            return off
-        cycle = struct.unpack_from("<Q", data, off)[0]; off += 8
-        tile_index = struct.unpack_from("<I", data, off)[0]; off += 4
-
-        if tile_filter is not None and tile_index not in tile_filter:
-            off += 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1
-            return off
-
-        uid = struct.unpack_from("<I", data, off)[0]; off += 4
-        data_f = struct.unpack_from("<I", data, off)[0]; off += 4
-        dest = struct.unpack_from("<I", data, off)[0]; off += 4
-        src0 = struct.unpack_from("<I", data, off)[0]; off += 4
-        src1 = struct.unpack_from("<I", data, off)[0]; off += 4
-        src2 = struct.unpack_from("<I", data, off)[0]; off += 4
-        stage = data[off]; off += 1
-        imm = data[off]; off += 1
-        cflag = data[off]; off += 1
-        off += 1 + 1  # xcptn + simdi
-
-        event = PipeEvent(
-            cycle=cycle, tile_index=tile_index, uid=uid,
-            data=data_f, dest=dest, src0=src0, src1=src1, src2=src2,
-            stage=stage, imm=imm, cflag=cflag,
-        )
-        return (event, off)
-
-    elif evt_id == 4:  # switch_pos_trace_entry
-        off = _align(offset, 64)
-        off += 8 + 4 + 1 + 1 + 1 + 1 + 1
-        return off
-
-    elif evt_id == 5:  # wavelet_entry
-        off = _align(offset, 16)
-        if not yield_wavelets:
-            off += 2 + 2 + 2 + 1 + 1
-            off = _align(off, 64)
-            off += 8 + 2 + 2 + 2 + 2
-            return off
-        pe_x = struct.unpack_from("<H", data, off)[0]; off += 2
-        pe_y = struct.unpack_from("<H", data, off)[0]; off += 2
-        color = struct.unpack_from("<H", data, off)[0]; off += 2
-        ctrlbit = struct.unpack_from("<b", data, off)[0]; off += 1
-        half_wavelet = struct.unpack_from("<b", data, off)[0]; off += 1
-        off = _align(off, 64)
-        cycle = struct.unpack_from("<Q", data, off)[0]; off += 8
-        wvlt_cnt = struct.unpack_from("<H", data, off)[0]; off += 2
-        wvlt_idx = struct.unpack_from("<H", data, off)[0]; off += 2
-        wvlt_data = struct.unpack_from("<H", data, off)[0]; off += 2
-        event_type = struct.unpack_from("<H", data, off)[0]; off += 2
-
-        if pe_filter is not None and (pe_x, pe_y) not in pe_filter:
-            return off
-
-        event = WaveletEvent(
-            cycle=cycle, pe_x=pe_x, pe_y=pe_y, color=color,
-            ctrlbit=ctrlbit, half_wavelet=half_wavelet,
-            wvlt_cnt=wvlt_cnt, wvlt_idx=wvlt_idx, wvlt_data=wvlt_data,
-            event_type=event_type,
-        )
-        return (event, off)
-
-    elif evt_id == 6:  # wavelet_trace_entry
-        off = _align(offset, 64)
-        off += 8 + 8 + 4 + 2 + 2
-        off = _align(off, 32)
-        off += 4
-        return off
-
-    else:
-        raise ValueError(f"Unknown event id {evt_id}")
 
 
 # --------------------------------------------------------------------------- #

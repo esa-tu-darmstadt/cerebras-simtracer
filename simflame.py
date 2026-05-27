@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 
 from tqdm import tqdm
@@ -26,6 +27,7 @@ from ctf import (
     resolve_trace_dir,
     stream0_path,
 )
+from callstack import reconstruct
 
 
 # --------------------------------------------------------------------------- #
@@ -33,20 +35,11 @@ from ctf import (
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class TileState:
-    """Tracks the call stack for a single tile."""
-    call_stack: list = field(default_factory=list)
+class TileProfile:
+    """Accumulated speedscope events for a single tile."""
     events: list = field(default_factory=list)
     first_cycle: int = 0
     last_cycle: int = 0
-    prev_func: str = None
-    current_task: int = -1
-
-    def open_frame(self, frame_idx, cycle):
-        self.events.append({"type": "O", "frame": frame_idx, "at": cycle})
-
-    def close_frame(self, frame_idx, cycle):
-        self.events.append({"type": "C", "frame": frame_idx, "at": cycle})
 
 
 def build_speedscope(trace_path, tile_elf_mapping, elf_lookups, tile_filter=None,
@@ -61,114 +54,31 @@ def build_speedscope(trace_path, tile_elf_mapping, elf_lookups, tile_filter=None
             frame_names.append(name)
         return frame_index[name]
 
-    states = {}
+    tiles = {}  # tile_index -> TileProfile (insertion order = first-seen order)
 
-    def get_state(tile_idx):
-        if tile_idx not in states:
-            states[tile_idx] = TileState()
-        return states[tile_idx]
-
-    event_count = 0
-    stat_calls = 0
-    stat_returns = 0
-    stat_task_switches = 0
-    stat_task_terms = 0
     file_size = os.path.getsize(trace_path)
     pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Processing",
                 file=sys.stderr)
-    for evt in parse_ctf_stream(trace_path, tile_filter=tile_filter, progress=pbar):
-        tile_idx = evt.tile_index
-        event_count += 1
-
-        elf_path = tile_elf_mapping.get(tile_idx)
-        if not elf_path:
-            raise RuntimeError(
-                f"Tile {tile_idx} has trace events but no ELF mapping. "
-                f"Is the bin/ directory complete?"
-            )
-        lookup = elf_lookups[elf_path]
-
-        state = get_state(tile_idx)
-        if state.first_cycle == 0:
-            state.first_cycle = evt.cycle
-
-        # inst_ptr is a word address (16-bit words); ELF symbols use byte addresses
-        func_name, is_entry = lookup.lookup(evt.inst_ptr * 2)
-
-        state.last_cycle = evt.cycle
-
-        # Task frame management
-        if evt.task_color != state.current_task:
-            stat_task_switches += 1
-            for fn in reversed(state.call_stack):
-                state.close_frame(get_frame_idx(fn), evt.cycle)
-            state.call_stack.clear()
-            if state.current_task >= 0:
-                state.close_frame(get_frame_idx(f"task {state.current_task}"), evt.cycle)
-            state.current_task = evt.task_color
-            state.open_frame(get_frame_idx(f"task {evt.task_color}"), evt.cycle)
-            state.prev_func = None
-
-        if evt.term_op == 1:
-            stat_task_terms += 1
-            for fn in reversed(state.call_stack):
-                state.close_frame(get_frame_idx(fn), evt.cycle)
-            state.call_stack.clear()
-            if state.current_task >= 0:
-                state.close_frame(get_frame_idx(f"task {state.current_task}"), evt.cycle)
-                state.current_task = -1
-            state.prev_func = None
-            continue
-
-        arch = lookup.arch
-        if evt.inst_bin & arch.jmp_r15_mask == arch.jmp_r15:
-            stat_returns += 1
-            if state.call_stack:
-                top = state.call_stack[-1]
-                state.close_frame(get_frame_idx(top), evt.cycle)
-                state.call_stack.pop()
-            state.prev_func = state.call_stack[-1] if state.call_stack else None
-            continue
-
-        if func_name != state.prev_func:
-            if is_entry and state.prev_func is not None:
-                stat_calls += 1
-                state.call_stack.append(func_name)
-                state.open_frame(get_frame_idx(func_name), evt.cycle)
-            elif not state.call_stack:
-                state.call_stack.append(func_name)
-                state.open_frame(get_frame_idx(func_name), evt.cycle)
-            elif func_name in state.call_stack:
-                while state.call_stack and state.call_stack[-1] != func_name:
-                    top = state.call_stack.pop()
-                    state.close_frame(get_frame_idx(top), evt.cycle)
-            else:
-                if state.call_stack:
-                    top = state.call_stack.pop()
-                    state.close_frame(get_frame_idx(top), evt.cycle)
-                state.call_stack.append(func_name)
-                state.open_frame(get_frame_idx(func_name), evt.cycle)
-
-        state.prev_func = func_name
+    stats = Counter()
+    events = parse_ctf_stream(trace_path, tile_filter=tile_filter, progress=pbar)
+    for kind, tile_idx, label, cycle in reconstruct(
+            events, tile_elf_mapping, elf_lookups, stats=stats):
+        prof = tiles.get(tile_idx)
+        if prof is None:
+            prof = tiles[tile_idx] = TileProfile(first_cycle=cycle)
+        prof.last_cycle = cycle
+        prof.events.append({"type": kind, "frame": get_frame_idx(label), "at": cycle})
 
     pbar.close()
 
-    for tile_idx, state in states.items():
-        for fn in reversed(state.call_stack):
-            state.close_frame(get_frame_idx(fn), state.last_cycle)
-        state.call_stack.clear()
-        if state.current_task >= 0:
-            state.close_frame(get_frame_idx(f"task {state.current_task}"), state.last_cycle)
-            state.current_task = -1
-
-    print(f"  Events: {event_count}  calls: {stat_calls}  returns: {stat_returns}  "
-          f"task switches: {stat_task_switches}  task terminations: {stat_task_terms}",
-          file=sys.stderr)
+    print(f"  Events: {stats['events']}  calls: {stats['calls']}  "
+          f"returns: {stats['returns']}  task switches: {stats['task_switches']}  "
+          f"task terminations: {stats['task_terms']}", file=sys.stderr)
 
     profiles = []
-    for tile_idx in sorted(states.keys()):
-        state = states[tile_idx]
-        if not state.events:
+    for tile_idx in sorted(tiles.keys()):
+        prof = tiles[tile_idx]
+        if not prof.events:
             continue
         x = tile_idx % grid_width
         y = tile_idx // grid_width
@@ -176,9 +86,9 @@ def build_speedscope(trace_path, tile_elf_mapping, elf_lookups, tile_filter=None
             "type": "evented",
             "name": f"Tile {tile_idx} (P{x}.{y})",
             "unit": "none",
-            "startValue": state.first_cycle,
-            "endValue": state.last_cycle,
-            "events": state.events,
+            "startValue": prof.first_cycle,
+            "endValue": prof.last_cycle,
+            "events": prof.events,
         })
 
     return {

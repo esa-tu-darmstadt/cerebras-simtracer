@@ -1,4 +1,6 @@
 *.json
+*.pftrace
+*.pftrace.gz
 __pycache__/
 *.egg-info/
 dist/
