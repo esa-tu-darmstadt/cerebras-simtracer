@@ -56,13 +56,15 @@ from ctf import (
     DebugCountersEvent,
     PIPE_WRITEBACK_STAGE,
     PIPE_NO_VALUE_U32,
-    parse_ctf_stream,
+    parse_ctf_trace,
     load_all_elf_lookups,
     build_elf_mapping,
     read_grid_dims,
     resolve_bin_root,
     resolve_trace_dir,
-    stream0_path,
+    stream_paths,
+    streams_for_tiles,
+    streams_total_size,
 )
 
 
@@ -290,7 +292,7 @@ class TileEmitter:
 #  Build
 # --------------------------------------------------------------------------- #
 
-def build_perfetto(trace_path, tile_elf_mapping, elf_lookups, *, grid_width,
+def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
                    channels, bin_cycles, out_path, tile_filter=None,
                    cycle_range=None, quiet=False):
     writer = pb.TraceWriter(out_path)
@@ -307,11 +309,16 @@ def build_perfetto(trace_path, tile_elf_mapping, elf_lookups, *, grid_width,
     if tile_filter is not None:
         pe_filter = {(t % grid_width, t // grid_width) for t in tile_filter}
 
-    pbar = (tqdm(total=os.path.getsize(trace_path), unit="B", unit_scale=True,
+    paths = (streams_for_tiles(trace_dir, tile_filter) if tile_filter
+             else stream_paths(trace_dir))
+    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
                  desc="Processing", file=sys.stderr) if not quiet else None)
-    base_iter = parse_ctf_stream(
-        trace_path, want_ids=channels.want_ids(), tile_filter=tile_filter,
-        pe_filter=pe_filter, cycle_range=cycle_range, progress=pbar)
+    # Each tile (and its per-track binners) lives in a single stream, already in
+    # cycle order; concatenation (merge=False) keeps per-tile/per-track order.
+    base_iter = parse_ctf_trace(
+        trace_dir, want_ids=channels.want_ids(), tile_filter=tile_filter,
+        pe_filter=pe_filter, grid_width=grid_width, cycle_range=cycle_range,
+        progress=pbar, merge=False)
 
     counts = Counter()
 
@@ -469,7 +476,7 @@ def main():
         tile_filter = set(int(t.strip()) for t in args.tiles.split(","))
 
     build_perfetto(
-        stream0_path(trace_dir), tile_elf_mapping, elf_lookups,
+        trace_dir, tile_elf_mapping, elf_lookups,
         grid_width=grid_width, channels=channels, bin_cycles=args.bin_cycles,
         out_path=args.output, tile_filter=tile_filter,
         cycle_range=parse_cycle_range(args.cycles), quiet=args.quiet,

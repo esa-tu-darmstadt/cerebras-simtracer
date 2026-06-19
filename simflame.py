@@ -19,13 +19,15 @@ from dataclasses import dataclass, field
 from tqdm import tqdm
 
 from ctf import (
-    parse_ctf_stream,
+    parse_ctf_trace,
     load_all_elf_lookups,
     build_elf_mapping,
     read_grid_dims,
     resolve_bin_root,
     resolve_trace_dir,
-    stream0_path,
+    stream_paths,
+    streams_for_tiles,
+    streams_total_size,
 )
 from callstack import reconstruct
 
@@ -42,7 +44,7 @@ class TileProfile:
     last_cycle: int = 0
 
 
-def build_speedscope(trace_path, tile_elf_mapping, elf_lookups, tile_filter=None,
+def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
                      grid_width=12):
     """Process the full trace and build a speedscope JSON structure."""
     frame_names = []
@@ -56,11 +58,16 @@ def build_speedscope(trace_path, tile_elf_mapping, elf_lookups, tile_filter=None
 
     tiles = {}  # tile_index -> TileProfile (insertion order = first-seen order)
 
-    file_size = os.path.getsize(trace_path)
-    pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Processing",
-                file=sys.stderr)
+    paths = (streams_for_tiles(trace_dir, tile_filter) if tile_filter
+             else stream_paths(trace_dir))
+    pbar = tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
+                desc="Processing", file=sys.stderr)
     stats = Counter()
-    events = parse_ctf_stream(trace_path, tile_filter=tile_filter, progress=pbar)
+    # Call-stack reconstruction is per-tile; each tile lives in one stream and
+    # each stream is already in cycle order, so concatenation (merge=False)
+    # keeps every tile's events ordered without a cross-stream merge.
+    events = parse_ctf_trace(trace_dir, tile_filter=tile_filter, progress=pbar,
+                             merge=False)
     for kind, tile_idx, label, cycle in reconstruct(
             events, tile_elf_mapping, elf_lookups, stats=stats):
         prof = tiles.get(tile_idx)
@@ -131,7 +138,6 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    stream_path = stream0_path(trace_dir)
     grid_width, grid_height = read_grid_dims(trace_dir)
 
     tile_filter = None
@@ -149,7 +155,7 @@ def main():
     tile_elf_mapping = build_elf_mapping(elf_lookups, grid_width, verbose)
 
     speedscope = build_speedscope(
-        stream_path, tile_elf_mapping, elf_lookups,
+        trace_dir, tile_elf_mapping, elf_lookups,
         tile_filter=tile_filter, grid_width=grid_width
     )
 

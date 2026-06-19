@@ -733,3 +733,174 @@ def read_grid_dims(trace_dir):
 
 def stream0_path(trace_dir):
     return os.path.join(trace_dir, "stream0")
+
+
+# --------------------------------------------------------------------------- #
+#  Multi-stream support
+# --------------------------------------------------------------------------- #
+#
+# The simulator splits its CTF trace across N stream files (stream0..stream{N-1})
+# inside simfab_traces/. global_simdata.json describes the split:
+#   "traceFiles": N            — number of stream files
+#   "streamMap": [ {"tileId": int, "streamId": int}, ... ]
+#                              — which stream file each tile's events land in;
+#                                streamId == -1 means the tile was not traced.
+# A single tile's events live entirely in one stream, so per-tile queries read
+# only that one file. Older single-stream traces have no traceFiles/streamMap;
+# they fall back to one file (stream0) holding every tile.
+
+
+def read_stream_map(trace_dir):
+    """Return (num_files, tile_to_stream) parsed from global_simdata.json.
+
+    `num_files` is the number of stream files (>= 1). `tile_to_stream` maps a
+    tile index to its stream id; tiles with streamId == -1 (untraced) are
+    omitted. For an old/single-stream trace (no traceFiles or no streamMap),
+    returns (1, {}) — meaning "one file, stream0, holds everything".
+    """
+    import json
+    path = os.path.join(trace_dir, "global_simdata.json")
+    try:
+        with open(path) as f:
+            simdata = json.load(f)
+    except FileNotFoundError:
+        return 1, {}
+    num_files = int(simdata.get("traceFiles", 1) or 1)
+    tile_to_stream = {}
+    for entry in simdata.get("streamMap", []) or []:
+        sid = entry["streamId"]
+        if sid < 0:
+            continue
+        tile_to_stream[entry["tileId"]] = sid
+    return num_files, tile_to_stream
+
+
+def stream_paths(trace_dir):
+    """Return the ordered list of existing stream{i} file paths.
+
+    Indexed 0..num_files-1, skipping any that are absent on disk. Always
+    includes stream0 if present (single-stream back-compat).
+    """
+    num_files, _ = read_stream_map(trace_dir)
+    paths = []
+    for i in range(num_files):
+        p = os.path.join(trace_dir, f"stream{i}")
+        if os.path.isfile(p):
+            paths.append(p)
+    if not paths:  # defensive: at least try stream0
+        p = stream0_path(trace_dir)
+        if os.path.isfile(p):
+            paths.append(p)
+    return paths
+
+
+def stream_of_tile(trace_dir, tile):
+    """Return the stream id (int) that holds tile `tile`'s events.
+
+    Falls back to 0 when the trace has no streamMap (single-stream) or the tile
+    is absent from the map (treated as stream0 for back-compat).
+    """
+    _num, tile_to_stream = read_stream_map(trace_dir)
+    return tile_to_stream.get(tile, 0)
+
+
+def streams_for_tiles(trace_dir, tiles):
+    """Return the sorted list of stream{i} file paths that hold any of `tiles`.
+
+    Consults the streamMap so a per-tile/per-PE query reads ONLY the relevant
+    stream file(s), never scanning every stream for one tile.
+    """
+    _num, tile_to_stream = read_stream_map(trace_dir)
+    want_sids = {tile_to_stream.get(t, 0) for t in tiles}
+    paths = []
+    for sid in sorted(want_sids):
+        p = os.path.join(trace_dir, f"stream{sid}")
+        if os.path.isfile(p):
+            paths.append(p)
+    return paths
+
+
+def streams_total_size(paths):
+    """Sum of byte sizes of the given stream file paths (for progress bars)."""
+    return sum(os.path.getsize(p) for p in paths)
+
+
+def elf_of_tile(tile_elf_mapping, tile):
+    """Return the ELF path for `tile`, or None.
+
+    `tile_elf_mapping` is the dict returned by `build_elf_mapping`. This is the
+    clean supported "given a tile, find its ELF" lookup; equivalent to
+    `build_elf_mapping(...).get(tile)`.
+    """
+    return tile_elf_mapping.get(tile)
+
+
+def _heap_merge_streams(generators):
+    """Merge per-stream event generators into one cycle-ordered stream.
+
+    Each input generator is already in trace (cycle) order, so a k-way heap
+    merge on `.cycle` yields a globally cycle-ordered stream.
+    """
+    import heapq
+
+    def keyed(idx, gen):
+        for evt in gen:
+            yield evt.cycle, idx, evt
+
+    yield from (evt for _cyc, _idx, evt in
+                heapq.merge(*(keyed(i, g) for i, g in enumerate(generators)),
+                            key=lambda t: (t[0], t[1])))
+
+
+def parse_ctf_trace(trace_dir, want_ids=(2,), tile_filter=None, pe_filter=None,
+                    cycle_range=None, progress=None, merge=True,
+                    grid_width=None):
+    """Parse a (possibly multi-stream) CTF trace and yield typed events.
+
+    Picks the stream file(s) to read from the streamMap:
+      * `tile_filter` set  -> read only the stream(s) holding those tiles.
+      * `pe_filter` set    -> map each (PE_x, PE_y) to tile = PE_y*grid_width +
+                              PE_x (needs `grid_width`) and read those stream(s).
+      * neither            -> read every stream file.
+
+    A single tile lives entirely in one stream, so a per-tile query needs no
+    cross-stream merge. For whole-trace consumers that need cycle order, pass
+    `merge=True` (default) to heap-merge the per-stream generators; pass
+    `merge=False` to simply concatenate the streams (cheaper, fine for pure
+    count aggregation like the `tiles` command).
+
+    The `tile_filter` / `pe_filter` are still applied per-event inside
+    `parse_ctf_stream`, so passing both a filter and an over-broad stream set is
+    always correct (just less efficient).
+    """
+    tiles = set()
+    if tile_filter is not None:
+        tiles |= set(tile_filter)
+    if pe_filter is not None:
+        if grid_width is None:
+            raise ValueError("pe_filter requires grid_width to pick streams")
+        tiles |= {py * grid_width + px for (px, py) in pe_filter}
+
+    if tiles:
+        paths = streams_for_tiles(trace_dir, tiles)
+    else:
+        paths = stream_paths(trace_dir)
+
+    metadata_path = os.path.join(trace_dir, "metadata")
+
+    def gen_for(path):
+        return parse_ctf_stream(
+            path, want_ids=want_ids, tile_filter=tile_filter,
+            pe_filter=pe_filter, cycle_range=cycle_range, progress=progress,
+            metadata_path=metadata_path)
+
+    if len(paths) <= 1:
+        for path in paths:
+            yield from gen_for(path)
+        return
+
+    if merge:
+        yield from _heap_merge_streams([gen_for(p) for p in paths])
+    else:
+        for path in paths:
+            yield from gen_for(path)

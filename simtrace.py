@@ -40,12 +40,15 @@ from ctf import (
     PIPE_NO_VALUE_U32,
     PIPE_NO_VALUE_U8,
     parse_ctf_stream,
+    parse_ctf_trace,
     load_all_elf_lookups,
     build_elf_mapping,
     read_grid_dims,
     resolve_bin_root,
     resolve_trace_dir,
-    stream0_path,
+    stream_paths,
+    streams_for_tiles,
+    streams_total_size,
 )
 
 
@@ -171,9 +174,11 @@ class TileTrace:
 
 def collect_tile_trace(trace_dir, tile_index, *, cycle_range=None,
                        want_pipe=False, show_progress=True):
-    """Stream the CTF file once, keeping only events for `tile_index`."""
-    sp = stream0_path(trace_dir)
-    file_size = os.path.getsize(sp)
+    """Stream the relevant CTF file once, keeping only events for `tile_index`.
+
+    Reads only the stream file holding `tile_index` (from the streamMap)."""
+    paths = streams_for_tiles(trace_dir, {tile_index})
+    file_size = streams_total_size(paths)
     pbar = (tqdm(total=file_size, unit="B", unit_scale=True, desc="reading trace",
                  file=sys.stderr) if show_progress else None)
 
@@ -181,8 +186,8 @@ def collect_tile_trace(trace_dir, tile_index, *, cycle_range=None,
     pipe_by_uid = {}
 
     want_ids = (2, 3) if want_pipe else (2,)
-    for evt in parse_ctf_stream(
-        sp, want_ids=want_ids, tile_filter={tile_index}, progress=pbar,
+    for evt in parse_ctf_trace(
+        trace_dir, want_ids=want_ids, tile_filter={tile_index}, progress=pbar,
         cycle_range=cycle_range,
     ):
         if isinstance(evt, DispatchEvent):
@@ -247,11 +252,12 @@ def setup_context(args):
 
 def cmd_tiles(args, ctx):
     """List tiles that appear in the trace (with their ELF and event count)."""
-    sp = stream0_path(ctx.trace_dir)
+    paths = stream_paths(ctx.trace_dir)
     counts = Counter()
-    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
                  desc="scanning", file=sys.stderr) if not args.quiet else None)
-    for evt in parse_ctf_stream(sp, progress=pbar):
+    # Pure count aggregation across all streams — no cycle merge needed.
+    for evt in parse_ctf_trace(ctx.trace_dir, progress=pbar, merge=False):
         counts[evt.tile_index] += 1
     if pbar is not None:
         pbar.close()
@@ -380,15 +386,15 @@ def cmd_find(args, ctx):
     for f in candidates:
         print(f"  {f.name}  @ 0x{f.start:06x}  (size {f.size})", file=sys.stderr)
 
-    sp = stream0_path(ctx.trace_dir)
-    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+    paths = streams_for_tiles(ctx.trace_dir, {tile})
+    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
                  desc="scanning", file=sys.stderr) if not args.quiet else None)
 
     print(f"{'cycle':>10}  {'task':>4}  function  (uid)")
     last_func_per_cycle = None
     hit_count = 0
-    for evt in parse_ctf_stream(sp, tile_filter={tile}, progress=pbar,
-                                cycle_range=cyc_range):
+    for evt in parse_ctf_trace(ctx.trace_dir, tile_filter={tile}, progress=pbar,
+                               cycle_range=cyc_range):
         addr = evt.inst_ptr * 2
         if addr in entry_addrs:
             fn = entry_addrs[addr]
@@ -526,8 +532,8 @@ def cmd_wavelets(args, ctx):
     if args.colors:
         colors = set(int(c, 0) for c in args.colors.split(","))
 
-    sp = stream0_path(ctx.trace_dir)
-    pbar = (tqdm(total=os.path.getsize(sp), unit="B", unit_scale=True,
+    paths = streams_for_tiles(ctx.trace_dir, {tile})
+    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
                  desc="scanning", file=sys.stderr) if not args.quiet else None)
 
     print(f"# tile P{pe_x}.{pe_y} (PE_x={pe_x}, PE_y={pe_y})")
@@ -535,9 +541,9 @@ def cmd_wavelets(args, ctx):
           f"{'cnt':>4}  {'idx':>4}  {'data':>6}  {'ev':>3}")
 
     count = 0
-    for evt in parse_ctf_stream(sp, want_ids=(5,), progress=pbar,
-                                pe_filter={(pe_x, pe_y)},
-                                cycle_range=cyc_range):
+    for evt in parse_ctf_trace(ctx.trace_dir, want_ids=(5,), progress=pbar,
+                               pe_filter={(pe_x, pe_y)}, grid_width=ctx.grid_width,
+                               cycle_range=cyc_range):
         if not isinstance(evt, WaveletEvent):
             continue
         if colors is not None and evt.color not in colors:
