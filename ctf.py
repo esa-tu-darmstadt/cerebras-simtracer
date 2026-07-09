@@ -289,31 +289,6 @@ class DispatchEvent:
 
 
 @dataclass
-class WaveletEvent:
-    """wavelet_entry (event id=5): per-wavelet send/receive event on a PE.
-
-    Emitted by the simulator whenever a wavelet crosses a fabric interface.
-    `event_type` distinguishes send vs receive (and other variants); exact enum
-    values are not documented in the metadata — print and infer from context.
-
-    `cycle` is the simulator clock at the event (same scale as
-    `DispatchEvent.cycle`, so the two streams can be merged for correlation).
-    The CTF field is named "timestamp" — that's a misnomer; values appear in
-    simulated cycles, matching what the Cerebras profiler GUI displays.
-    """
-    cycle: int          # simulator cycle (CTF metadata calls this `timestamp`)
-    pe_x: int
-    pe_y: int
-    color: int
-    ctrlbit: int
-    half_wavelet: int
-    wvlt_cnt: int
-    wvlt_idx: int
-    wvlt_data: int
-    event_type: int
-
-
-@dataclass
 class PipeEvent:
     """hwm_pipe_trace_entry (event id=3): per-pipeline-stage operand snapshot.
 
@@ -379,9 +354,9 @@ class SwitchPosEvent:
 class WaveletTraceEvent:
     """wavelet_trace_entry (event id=6): per-wavelet fabric event.
 
-    The wavelet stream emitted by these simulator builds (distinct from the
-    id=5 `wavelet_entry`). `ident` is a packed wavelet/route identifier; `data`
-    is the 16-bit payload; `fields` is a packed control word.
+    The wavelet stream emitted by these simulator builds. `ident` is a packed
+    wavelet/route identifier; `data` is the 16-bit payload; `fields` is a packed
+    control word; `index` is the color/route slot; `tile_index` is the PE.
     """
     cycle: int
     ident: int
@@ -522,12 +497,6 @@ def _build_event(eid, name, vals, cycle):
             data=vals["data"], dest=vals["dest"], src0=vals["src0"],
             src1=vals["src1"], src2=vals["src2"], stage=vals["stage"],
             imm=vals["imm"], cflag=vals["cflag"])
-    if eid == 5:
-        return WaveletEvent(
-            cycle=cycle, pe_x=vals["PE_x"], pe_y=vals["PE_y"], color=vals["color"],
-            ctrlbit=vals["ctrlbit"], half_wavelet=vals["half_wavelet"],
-            wvlt_cnt=vals["wvlt_cnt"], wvlt_idx=vals["wvlt_idx"],
-            wvlt_data=vals["wvlt_data"], event_type=vals["event_type"])
     if eid == 0:
         return BackpressureEvent(
             cycle=cycle, tile_index=vals["tile_index"],
@@ -570,7 +539,7 @@ def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
         tile_filter: set of tile indices to keep (applies to events carrying a
             `tile_index` field), or None for all.
         pe_filter: set of (PE_x, PE_y) tuples to keep (applies to events
-            carrying PE_x/PE_y, e.g. id=5 wavelet), or None for all.
+            carrying PE_x/PE_y, e.g. id=1 debug counters), or None for all.
         cycle_range: optional (start, end) — yields events with
             start <= cycle < end. `end` may be None (open-ended); streaming
             stops once we pass `end`. The cycle comes from the event's `cycle`

@@ -15,7 +15,7 @@ Per tile, the trace contains a process group with these tracks:
   backpressure Ln counter: per-link fabric backpressure level. By default the
                   max per window (the trace has millions of samples); use
                   --backpressure-raw for every sample.
-  wavelets        instant events per wavelet (id=5 and/or id=6), carrying the
+  wavelets        instant events per wavelet (id=6), carrying the
                   payload/identifier as annotations (opt-out; high volume).
                   When --flow is on, each wavelet's hops across the fabric are
                   linked by ident, so a forwarded wavelet ("train") shows as a
@@ -48,7 +48,6 @@ import perfetto_pb as pb
 from callstack import reconstruct
 from ctf import (
     DispatchEvent,
-    WaveletEvent,
     WaveletTraceEvent,
     PipeEvent,
     BackpressureEvent,
@@ -96,7 +95,7 @@ class Channels:
         if self.backpressure:
             ids.add(0)
         if self.want_wavelets:
-            ids.update((5, 6))
+            ids.add(6)
         if self.regs:
             ids.add(3)
         if self.switch_pos:
@@ -233,17 +232,11 @@ class TileEmitter:
             bn.add(evt.cycle, evt.back_pressure)
 
     def emit_wavelet(self, evt):
-        if isinstance(evt, WaveletEvent):
-            ann = {"color": evt.color, "data": f"0x{evt.wvlt_data:04x}",
-                   "cnt": evt.wvlt_cnt, "idx": evt.wvlt_idx, "ctrl": evt.ctrlbit,
-                   "half": evt.half_wavelet, "event_type": evt.event_type}
-            name = f"c{evt.color}"
-            flow = (evt.color,) if self.ch.flow else ()
-        else:  # WaveletTraceEvent (id=6)
-            ann = {"ident": evt.ident, "index": evt.index,
-                   "data": f"0x{evt.data:04x}", "fields": evt.fields}
-            name = f"w{evt.index}"
-            flow = (evt.ident & 0xFFFFFFFFFFFFFFFF,) if self.ch.flow else ()
+        # WaveletTraceEvent (id=6) — the SDK 2.1+ per-wavelet fabric event.
+        ann = {"ident": evt.ident, "index": evt.index,
+               "data": f"0x{evt.data:04x}", "fields": evt.fields}
+        name = f"w{evt.index}"
+        flow = (evt.ident & 0xFFFFFFFFFFFFFFFF,) if self.ch.flow else ()
         self.w.event(
             pb.track_event(self.wevents_uuid, pb.TYPE_INSTANT, name=name,
                            flow_ids=flow, annotations=ann),
@@ -337,13 +330,6 @@ def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
             elif t is BackpressureEvent:
                 counts["backpressure"] += 1
                 emitter_for(evt.tile_index).emit_backpressure(evt)
-            elif t is WaveletEvent:
-                counts["wavelet"] += 1
-                em = emitter_for(evt.pe_y * grid_width + evt.pe_x)
-                if em.wrate:
-                    em.wrate.add(evt.cycle)
-                if channels.wavelet_events:
-                    em.emit_wavelet(evt)
             elif t is WaveletTraceEvent:
                 counts["wavelet"] += 1
                 em = emitter_for(evt.tile_index)

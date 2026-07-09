@@ -35,7 +35,7 @@ from tqdm import tqdm
 from ctf import (
     DispatchEvent,
     PipeEvent,
-    WaveletEvent,
+    WaveletTraceEvent,
     PIPE_WRITEBACK_STAGE,
     PIPE_NO_VALUE_U32,
     PIPE_NO_VALUE_U8,
@@ -522,7 +522,7 @@ def cmd_regs(args, ctx):
 # --------------------------------------------------------------------------- #
 
 def cmd_wavelets(args, ctx):
-    """Show wavelet send/receive events for a tile (color + data + cycle)."""
+    """Show per-wavelet fabric events (`wavelet_trace_entry`, id=6) for a tile."""
     tile = resolve_tile(args.tile, ctx.grid_width)
     pe_x = tile % ctx.grid_width
     pe_y = tile // ctx.grid_width
@@ -536,21 +536,20 @@ def cmd_wavelets(args, ctx):
     pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
                  desc="scanning", file=sys.stderr) if not args.quiet else None)
 
-    print(f"# tile P{pe_x}.{pe_y} (PE_x={pe_x}, PE_y={pe_y})")
-    print(f"{'cycle':>10}  {'color':>5}  {'ctrl':>4}  {'half':>4}  "
-          f"{'cnt':>4}  {'idx':>4}  {'data':>6}  {'ev':>3}")
+    print(f"# tile P{pe_x}.{pe_y} (PE_x={pe_x}, PE_y={pe_y})  tile_index={tile}")
+    print(f"{'cycle':>10}  {'index':>6}  {'data':>6}  {'fields':>12}  {'ident':>20}")
 
+    # SDK 2.1+ emits the wavelet stream as id=6 `wavelet_trace_entry`, keyed by
+    # tile_index. `index` is the color/route slot; honour --colors against it.
     count = 0
-    for evt in parse_ctf_trace(ctx.trace_dir, want_ids=(5,), progress=pbar,
-                               pe_filter={(pe_x, pe_y)}, grid_width=ctx.grid_width,
-                               cycle_range=cyc_range):
-        if not isinstance(evt, WaveletEvent):
+    for evt in parse_ctf_trace(ctx.trace_dir, want_ids=(6,), progress=pbar,
+                               tile_filter={tile}, cycle_range=cyc_range):
+        if not isinstance(evt, WaveletTraceEvent):
             continue
-        if colors is not None and evt.color not in colors:
+        if colors is not None and evt.index not in colors:
             continue
-        print(f"{evt.cycle:>10}  {evt.color:>5}  {evt.ctrlbit:>4}  "
-              f"{evt.half_wavelet:>4}  {evt.wvlt_cnt:>4}  {evt.wvlt_idx:>4}  "
-              f"0x{evt.wvlt_data:04x}  {evt.event_type:>3}")
+        print(f"{evt.cycle:>10}  {evt.index:>6}  0x{evt.data:04x}  "
+              f"0x{evt.fields:010x}  0x{evt.ident:016x}")
         count += 1
         if args.limit and count >= args.limit:
             break
