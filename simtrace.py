@@ -589,6 +589,94 @@ def cmd_funcs(args, ctx):
 
 
 # --------------------------------------------------------------------------- #
+#  Subcommand: which  (coordinate -> ELF, and edge-vs-interior disassembly diff)
+# --------------------------------------------------------------------------- #
+
+def _disasm_by_func(elf_path, objdump):
+    """{func_name: [normalized asm lines]} from `objdump -D`. The leading address and
+    machine-byte columns are dropped and hex address/immediate literals are masked to `0x_`,
+    so two PEs that run the SAME code at different placements compare equal — only real
+    instruction differences (edge specialization, a logic change) survive."""
+    import subprocess, re
+    out = subprocess.run([objdump, "-D", elf_path],
+                         capture_output=True, text=True, check=True).stdout
+    hdr  = re.compile(r'^[0-9a-fA-F]+\s+<(.+)>:\s*$')
+    insn = re.compile(r'^\s*[0-9a-fA-F]+:\s+(?:[0-9a-fA-F]{2} )+\s*(\S.*?)\s*$')
+    # Mask operands that legitimately differ between two identical-logic PEs at different
+    # placements: hex literals, bracketed addresses [N], and any decimal >= 100 (data/code
+    # addresses). Small decimals (shift amounts, lane counts) are kept — a change there is real.
+    hexl = re.compile(r'0x[0-9a-fA-F]+')
+    addr = re.compile(r'\[\s*\d+\s*\]')
+    dec  = re.compile(r'(?<![\w.])\d{3,}(?![\w.])')
+    def norm(s):
+        s = hexl.sub("0x_", s)
+        s = addr.sub("[_]", s)
+        s = dec.sub("_", s)
+        return s
+    funcs, cur = {}, None
+    for line in out.splitlines():
+        h = hdr.match(line)
+        if h:
+            cur = h.group(1); funcs.setdefault(cur, [])
+            continue
+        m = insn.match(line)
+        if m and cur is not None:
+            funcs[cur].append(norm(m.group(1)))
+    return funcs
+
+
+def _print_disasm_diff(a, b, objdump, func_pat):
+    import difflib, fnmatch
+    (ca, _, pa, na), (cb, _, pb, nb) = a, b
+    fa, fb = _disasm_by_func(pa, objdump), _disasm_by_func(pb, objdump)
+    names = sorted(set(fa) | set(fb))
+    if func_pat:
+        names = [n for n in names if func_pat in n or fnmatch.fnmatchcase(n, func_pat)]
+    any_diff = False
+    for name in names:
+        la, lb = fa.get(name, []), fb.get(name, [])
+        if la == lb:
+            continue
+        any_diff = True
+        print(f"\n=== function {name}: DIFFERS  ({ca}:{na}  vs  {cb}:{nb}) ===")
+        for dl in difflib.unified_diff(la, lb, fromfile=f"{ca}:{na}",
+                                       tofile=f"{cb}:{nb}", lineterm=""):
+            print(dl)
+    if not any_diff:
+        print(f"\nNo instruction-level differences between {ca}({na}) and {cb}({nb}) "
+              f"in the compared function(s) — address/immediate literals masked.")
+
+
+def cmd_which(args):
+    """Map coordinate(s) to the ELF that runs there (works on a bare out/ dir — no trace)."""
+    try:
+        bin_root = resolve_bin_root(args.out_dir, args.bin_root)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+    gw = args.grid_width or 762   # WSE-3 fabric width; override with --grid-width
+    elf_lookups, _arch = load_all_elf_lookups(bin_root, verbose=args.verbose)
+    if not elf_lookups:
+        raise SystemExit("No ELF files found under " + bin_root)
+    mapping = build_elf_mapping(elf_lookups, gw, quiet=True)
+    resolved = []
+    for c in args.coords:
+        tile = resolve_tile(c, gw)
+        path = mapping.get(tile)
+        name = os.path.basename(path) if path else "?? (unmapped)"
+        print(f"  {c:>10}  tile {tile:>8}  (x={tile % gw}, y={tile // gw})  ->  {name}")
+        resolved.append((c, tile, path, name))
+    if args.diff:
+        if len(resolved) != 2:
+            raise SystemExit("--diff needs exactly two coordinates")
+        if not args.objdump:
+            raise SystemExit("--diff needs --objdump (the Cerebras llvm-objdump wrapper)")
+        if not resolved[0][2] or not resolved[1][2]:
+            raise SystemExit("a coordinate is unmapped — cannot diff")
+        _print_disasm_diff(resolved[0], resolved[1], args.objdump, args.func)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 #  Argument parser
 # --------------------------------------------------------------------------- #
 
@@ -664,6 +752,20 @@ def build_argparser():
     p.add_argument("--pattern", help="Filter by substring or fnmatch pattern")
     p.set_defaults(handler=cmd_funcs)
 
+    p = sub.add_parser("which",
+                       help="Map coordinate(s) to their ELF (no trace needed); "
+                            "with --diff, compare two PEs' disassembly")
+    p.add_argument("coords", nargs="+", help="One or more 'x.y' coordinates (or tile indices)")
+    p.add_argument("--grid-width", type=int, default=None,
+                   help="Fabric width for tile-index math (default 762 = WSE-3)")
+    p.add_argument("--diff", action="store_true",
+                   help="Disassemble the two given coordinates' ELFs and print a per-function "
+                        "diff (address/immediate literals masked). Requires --objdump and exactly "
+                        "two coordinates")
+    p.add_argument("--func", default=None,
+                   help="Restrict --diff to functions matching this substring/pattern")
+    p.set_defaults(handler=cmd_which, no_trace=True)
+
     p = sub.add_parser("wavelets",
                        help="Show wavelet send/receive events for a tile")
     p.add_argument("--tile", required=True, help="Tile index N or 'x.y' coord")
@@ -680,8 +782,11 @@ def build_argparser():
 def main():
     parser = build_argparser()
     args = parser.parse_args()
-    ctx = setup_context(args)
-    rc = args.handler(args, ctx) or 0
+    if getattr(args, "no_trace", False):     # commands that read only the ELFs (no CTF trace)
+        rc = args.handler(args) or 0
+    else:
+        ctx = setup_context(args)
+        rc = args.handler(args, ctx) or 0
     sys.exit(rc)
 
 
