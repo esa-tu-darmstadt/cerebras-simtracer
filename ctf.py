@@ -165,9 +165,11 @@ def build_elf_mapping(elf_lookups, grid_width, verbose=False, quiet=False):
     Build tile_index -> elf_path mapping from ELF PT_LOAD segment LMAs.
 
     Each Cerebras ELF encodes its target tile indices in the LMA of its PT_LOAD
-    segments: tile_index = (segment.p_paddr >> 40) & 0xFFFF, where
+    segments: tile_index = (segment.p_paddr >> 40) & 0xFFFFFF, where
     tile_index = fabric_y * grid_width + fabric_x. Shared ELFs have one PT_LOAD
-    per target tile.
+    per target tile. (The mask is 24-bit: a full WSE-3 fabric tile index
+    fabric_y*762+fabric_x reaches ~892k, so a 16-bit mask silently wraps every
+    tile below row ~86 onto a wrong index.)
     """
     mapping = {}
     for elf_path in elf_lookups:
@@ -177,7 +179,7 @@ def build_elf_mapping(elf_lookups, grid_width, verbose=False, quiet=False):
             elf = ELFFile(f)
             for seg in elf.iter_segments():
                 if seg["p_type"] == "PT_LOAD":
-                    tile_idx = (seg["p_paddr"] >> 40) & 0xFFFF
+                    tile_idx = (seg["p_paddr"] >> 40) & 0xFFFFFF
                     tile_indices.add(tile_idx)
 
         for tile_idx in sorted(tile_indices):
