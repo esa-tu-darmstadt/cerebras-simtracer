@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from tqdm import tqdm
 
+import ctf
 from ctf import (
     DispatchEvent,
     PipeEvent,
@@ -41,6 +42,7 @@ from ctf import (
     PIPE_NO_VALUE_U8,
     parse_ctf_stream,
     parse_ctf_trace,
+    parallel_streams,
     load_all_elf_lookups,
     build_elf_mapping,
     read_grid_dims,
@@ -250,15 +252,28 @@ def setup_context(args):
 #  Subcommand: tiles
 # --------------------------------------------------------------------------- #
 
+def _count_tiles_worker(path, metadata_path):
+    """Count dispatch events per tile in one stream (runs in a worker process)."""
+    counts = Counter()
+    for evt in parse_ctf_stream(path, want_ids=(2,), metadata_path=metadata_path):
+        counts[evt.tile_index] += 1
+    return counts
+
+
 def cmd_tiles(args, ctx):
     """List tiles that appear in the trace (with their ELF and event count)."""
     paths = stream_paths(ctx.trace_dir)
+    metadata_path = os.path.join(ctx.trace_dir, "metadata")
     counts = Counter()
-    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
-                 desc="scanning", file=sys.stderr) if not args.quiet else None)
-    # Pure count aggregation across all streams — no cycle merge needed.
-    for evt in parse_ctf_trace(ctx.trace_dir, progress=pbar, merge=False):
-        counts[evt.tile_index] += 1
+    # Pure per-tile count aggregation — each stream is counted in its own
+    # process and the per-stream Counters are summed here.
+    pbar = (tqdm(total=len(paths), unit="stream", desc="scanning",
+                 file=sys.stderr) if not args.quiet else None)
+    for _path, c in parallel_streams(paths, _count_tiles_worker,
+                                     args=(metadata_path,), jobs=args.jobs):
+        counts.update(c)
+        if pbar is not None:
+            pbar.update(1)
     if pbar is not None:
         pbar.close()
 
@@ -591,6 +606,10 @@ def build_argparser():
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress progress bar")
+    parser.add_argument("-j", "--jobs", type=int, default=None,
+                        help="Parallel worker processes for whole-trace scans "
+                             "(the 'tiles' command). Default: one per stream, "
+                             "capped at the CPU count. Use 1 to run serially.")
     parser.add_argument("--objdump", default=None,
                         help="Path to llvm-objdump (Cerebras toolchain). When "
                              "omitted, the disassembly column is left empty "

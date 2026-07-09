@@ -37,8 +37,11 @@ Usage:
 """
 
 import argparse
+import gzip
 import os
+import shutil
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 
@@ -55,7 +58,8 @@ from ctf import (
     DebugCountersEvent,
     PIPE_WRITEBACK_STAGE,
     PIPE_NO_VALUE_U32,
-    parse_ctf_trace,
+    parse_ctf_stream,
+    parallel_streams,
     load_all_elf_lookups,
     build_elf_mapping,
     read_grid_dims,
@@ -63,7 +67,6 @@ from ctf import (
     resolve_trace_dir,
     stream_paths,
     streams_for_tiles,
-    streams_total_size,
 )
 
 
@@ -285,10 +288,14 @@ class TileEmitter:
 #  Build
 # --------------------------------------------------------------------------- #
 
-def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
-                   channels, bin_cycles, out_path, tile_filter=None,
-                   cycle_range=None, quiet=False):
-    writer = pb.TraceWriter(out_path)
+def emit_stream(writer, base_iter, *, grid_width, channels, bin_cycles,
+                tile_elf_mapping, elf_lookups):
+    """Fold one event stream into ``writer`` as Perfetto packets.
+
+    Each tile (and its per-track binners) lives in a single stream and is
+    written as its own packet sequence, so this can run per-stream and the
+    sequences concatenate into one valid trace. Returns ``(counts, num_tiles)``.
+    """
     emitters = {}
 
     def emitter_for(tile_idx):
@@ -297,21 +304,6 @@ def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
             em = emitters[tile_idx] = TileEmitter(
                 writer, tile_idx, grid_width, channels, bin_cycles)
         return em
-
-    pe_filter = None
-    if tile_filter is not None:
-        pe_filter = {(t % grid_width, t // grid_width) for t in tile_filter}
-
-    paths = (streams_for_tiles(trace_dir, tile_filter) if tile_filter
-             else stream_paths(trace_dir))
-    pbar = (tqdm(total=streams_total_size(paths), unit="B", unit_scale=True,
-                 desc="Processing", file=sys.stderr) if not quiet else None)
-    # Each tile (and its per-track binners) lives in a single stream, already in
-    # cycle order; concatenation (merge=False) keeps per-tile/per-track order.
-    base_iter = parse_ctf_trace(
-        trace_dir, want_ids=channels.want_ids(), tile_filter=tile_filter,
-        pe_filter=pe_filter, grid_width=grid_width, cycle_range=cycle_range,
-        progress=pbar, merge=False)
 
     counts = Counter()
 
@@ -358,12 +350,102 @@ def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
 
     for em in emitters.values():
         em.close()
+    return counts, len(emitters)
+
+
+# Per-worker read-only state (set once per process by _pf_init).
+_PF = {}
+
+
+def _pf_init(metadata_path, want_ids, tile_filter, pe_filter, cycle_range,
+             grid_width, channels, bin_cycles, tile_elf_mapping, elf_lookups,
+             tmpdir):
+    _PF.update(metadata_path=metadata_path, want_ids=want_ids,
+               tile_filter=tile_filter, pe_filter=pe_filter,
+               cycle_range=cycle_range, grid_width=grid_width,
+               channels=channels, bin_cycles=bin_cycles,
+               mapping=tile_elf_mapping, lookups=elf_lookups, tmpdir=tmpdir)
+
+
+def _pf_worker(path):
+    """Emit one stream's Perfetto packets to a temp file; return (path, counts).
+
+    The temp file holds raw (uncompressed) ``TracePacket``s; the parent
+    concatenates the per-stream files (optionally gzipping) into the output.
+    """
+    s = _PF
+    fd, tmp = tempfile.mkstemp(prefix="simperf_", suffix=".pftrace",
+                               dir=s["tmpdir"])
+    os.close(fd)
+    writer = pb.TraceWriter(tmp)
+    base_iter = parse_ctf_stream(
+        path, want_ids=s["want_ids"], tile_filter=s["tile_filter"],
+        pe_filter=s["pe_filter"], cycle_range=s["cycle_range"],
+        metadata_path=s["metadata_path"])
+    counts, n_tiles = emit_stream(
+        writer, base_iter, grid_width=s["grid_width"], channels=s["channels"],
+        bin_cycles=s["bin_cycles"], tile_elf_mapping=s["mapping"],
+        elf_lookups=s["lookups"])
     writer.close()
+    return tmp, dict(counts), n_tiles
+
+
+def build_perfetto(trace_dir, tile_elf_mapping, elf_lookups, *, grid_width,
+                   channels, bin_cycles, out_path, tile_filter=None,
+                   cycle_range=None, quiet=False, jobs=None):
+    pe_filter = None
+    if tile_filter is not None:
+        pe_filter = {(t % grid_width, t // grid_width) for t in tile_filter}
+
+    paths = (streams_for_tiles(trace_dir, tile_filter) if tile_filter
+             else stream_paths(trace_dir))
+    metadata_path = os.path.join(trace_dir, "metadata")
+    want_ids = channels.want_ids()
+
+    # Each stream is emitted to its own temp file in a worker process; the files
+    # are concatenated (tiles are disjoint packet sequences, so order across
+    # streams is irrelevant) into the final trace, gzipped if requested.
+    tmpdir = tempfile.mkdtemp(prefix="simperfetto_",
+                              dir=os.path.dirname(os.path.abspath(out_path)))
+    pbar = (tqdm(total=len(paths), unit="stream", desc="Processing",
+                 file=sys.stderr) if not quiet else None)
+    counts = Counter()
+    n_tiles = 0
+    tmp_files = []
+    try:
+        for _path, (tmp, c, nt) in parallel_streams(
+                paths, _pf_worker, jobs=jobs, initializer=_pf_init,
+                initargs=(metadata_path, want_ids, tile_filter, pe_filter,
+                          cycle_range, grid_width, channels, bin_cycles,
+                          tile_elf_mapping, elf_lookups, tmpdir)):
+            tmp_files.append(tmp)
+            n_tiles += nt
+            for k, v in c.items():
+                counts[k] += v
+            if pbar is not None:
+                pbar.update(1)
+
+        out = (gzip.open(out_path, "wb") if out_path.endswith(".gz")
+               else open(out_path, "wb"))
+        with out:
+            for tmp in tmp_files:
+                with open(tmp, "rb") as src:
+                    shutil.copyfileobj(src, out, 8 * 1024 * 1024)
+    finally:
+        for tmp in tmp_files:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
 
     if pbar is not None:
         pbar.close()
     summary = "  ".join(f"{k}: {v:,}" for k, v in sorted(counts.items()))
-    print(f"  Tiles: {len(emitters)}  {summary}", file=sys.stderr)
+    print(f"  Tiles: {n_tiles}  {summary}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +469,9 @@ def build_argparser():
                    help="Override the directory containing bin/*.elf")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--quiet", action="store_true", help="Suppress progress bar")
+    p.add_argument("-j", "--jobs", type=int, default=None,
+                   help="Parallel worker processes (default: one per stream, "
+                        "capped at the CPU count; 1 = serial)")
 
     g = p.add_argument_group("channels")
     g.add_argument("--calls", action=argparse.BooleanOptionalAction, default=True,
@@ -466,6 +551,7 @@ def main():
         grid_width=grid_width, channels=channels, bin_cycles=args.bin_cycles,
         out_path=args.output, tile_filter=tile_filter,
         cycle_range=parse_cycle_range(args.cycles), quiet=args.quiet,
+        jobs=args.jobs,
     )
     print(f"Done → {args.output}", file=sys.stderr)
 

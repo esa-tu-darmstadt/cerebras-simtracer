@@ -857,6 +857,55 @@ def streams_total_size(paths):
     return sum(os.path.getsize(p) for p in paths)
 
 
+# --------------------------------------------------------------------------- #
+#  Cross-stream parallelism
+# --------------------------------------------------------------------------- #
+#
+# The streams are independent files and a tile lives entirely in one stream, so
+# any whole-trace consumer whose per-tile work is independent (event counts,
+# per-tile call-stack reconstruction, per-tile Perfetto packets) can process
+# each stream in its own process and combine the compact per-stream results.
+# With 20 streams on a many-core node this is the dominant whole-trace speedup,
+# multiplying on top of the faster per-event decode.
+
+
+def default_jobs(num_paths):
+    """Worker count for a parallel scan: one per stream, capped at the CPU count."""
+    return max(1, min(num_paths, os.cpu_count() or 1))
+
+
+def parallel_streams(paths, worker, args=(), jobs=None,
+                     initializer=None, initargs=()):
+    """Run ``worker(path, *args)`` over ``paths``, yielding ``(path, result)``.
+
+    Results are yielded as each stream finishes (not in ``paths`` order). With
+    ``jobs <= 1`` or a single path the work runs inline in this process (no pool,
+    easy to profile/debug); otherwise it fans out across a process pool sized by
+    ``default_jobs``. ``initializer``/``initargs`` run once per worker process —
+    use them to stash large read-only state (ELF symbol tables, the tile→ELF
+    map) in worker globals instead of pickling it per task.
+
+    ``worker`` and ``initializer`` must be importable top-level callables, and
+    every ``result`` must be picklable. Keep results compact (counts, per-tile
+    summaries, a temp-file path) — never the raw event stream.
+    """
+    if jobs is None:
+        jobs = default_jobs(len(paths))
+    if jobs <= 1 or len(paths) <= 1:
+        if initializer is not None:
+            initializer(*initargs)
+        for p in paths:
+            yield p, worker(p, *args)
+        return
+
+    import concurrent.futures as futures
+    with futures.ProcessPoolExecutor(max_workers=jobs, initializer=initializer,
+                                     initargs=initargs) as ex:
+        fut_to_path = {ex.submit(worker, p, *args): p for p in paths}
+        for fut in futures.as_completed(fut_to_path):
+            yield fut_to_path[fut], fut.result()
+
+
 def elf_of_tile(tile_elf_mapping, tile):
     """Return the ELF path for `tile`, or None.
 
