@@ -9,6 +9,7 @@ stages contain 0xFFFFFFFF sentinels).
 """
 
 import bisect
+import mmap
 import os
 import re
 import struct
@@ -51,6 +52,8 @@ PIPE_NO_VALUE_U8 = 0xFF
 PKT_HDR = struct.Struct("<IQ")       # magic(u32) + stream_id(u64) = 12 bytes
 PKT_CTX = struct.Struct("<QQQQQ")    # pkt_size + content_size + ts_begin + ts_end + events_discarded = 40 bytes
 EVT_HDR = struct.Struct("<QQ")       # id(u64) + timestamp(u64) = 16 bytes
+EVT_ID = struct.Struct("<Q")         # event id alone; timestamp read lazily
+EVT_HDR_SIZE = EVT_HDR.size
 
 PKT_OVERHEAD = PKT_HDR.size + PKT_CTX.size  # 52 bytes
 
@@ -397,38 +400,99 @@ class FieldSpec:
     align: int    # alignment in bits
 
 
+@dataclass
+class _Layout:
+    """Precomputed decode plan for an event at one start-parity.
+
+    CTF field alignment is relative to the enclosing packet start, and every
+    field here aligns to at most 8 bytes, so an event's exact byte layout is
+    fully determined by ``(offset - pkt_start) % 8``. For each of the 8 parities
+    we precompute a single ``struct.Struct`` covering the contiguous fixed
+    prefix (with inter-field padding baked in as ``x`` bytes), turning per-field
+    Python iteration into one ``unpack_from`` call. Only the mnemonic string in
+    the dispatch event (always the last field) needs the slow path.
+    """
+    prefix_struct: "struct.Struct"  # all fixed fields up to the first string
+    prefix_names: tuple             # names matching prefix_struct's outputs
+    prefix_size: int                # bytes from offset to end of prefix / string start
+    string_name: str                # name of the string field, or None
+    tail_fields: tuple              # fields after the string (general path; rare)
+    fixed_size: int                 # total event size when there is no string, else None
+
+
 class EventType:
-    """A trace event's name + ordered field layout, with decode/skip."""
+    """A trace event's name + ordered field layout, with decode/skip.
+
+    Layouts are precomputed once per start-parity in ``__init__``; ``decode`` and
+    ``skip`` then index by ``(offset - pkt_start) & 7`` and avoid the per-field
+    loop entirely (a single ``struct.unpack_from`` for decode, a constant add for
+    skipping a fixed-size event).
+    """
 
     def __init__(self, eid, name, fields):
         self.id = eid
         self.name = name
         self.fields = fields
+        self._layouts = tuple(self._build_layout(p) for p in range(8))
+
+    def _build_layout(self, start_mod):
+        pos = start_mod          # byte position relative to pkt_start (only %8 matters)
+        fmt = "<"
+        names = []
+        i, n = 0, len(self.fields)
+        while i < n and not self.fields[i].is_str:
+            f = self.fields[i]
+            aligned = align_up(pos, f.align)
+            if aligned != pos:
+                fmt += "%dx" % (aligned - pos)
+            fmt += f.fmt
+            names.append(f.name)
+            pos = aligned + f.nbytes
+            i += 1
+        if i == n:
+            st = struct.Struct(fmt)
+            return _Layout(st, tuple(names), st.size, None, (), st.size)
+        # fields[i] is a string (the dispatch mnemonic): fold its leading pad
+        # into the prefix so prefix_size lands exactly on the string start.
+        f = self.fields[i]
+        aligned = align_up(pos, f.align)
+        if aligned != pos:
+            fmt += "%dx" % (aligned - pos)
+        st = struct.Struct(fmt)
+        return _Layout(st, tuple(names), st.size, f.name,
+                       tuple(self.fields[i + 1:]), None)
 
     def decode(self, data, pkt_start, offset):
         """Return (values dict, new offset)."""
-        vals = {}
-        off = offset
-        for f in self.fields:
+        lay = self._layouts[(offset - pkt_start) & 7]
+        vals = dict(zip(lay.prefix_names,
+                        lay.prefix_struct.unpack_from(data, offset)))
+        if lay.string_name is None:
+            return vals, offset + lay.fixed_size
+        off = offset + lay.prefix_size
+        end = data.find(b"\x00", off)
+        if end < 0:
+            raise ValueError("unterminated string field")
+        vals[lay.string_name] = data[off:end].decode("utf-8", errors="replace")
+        off = end + 1
+        for f in lay.tail_fields:  # fields after a string — empty for known events
             off = align_up(off - pkt_start, f.align) + pkt_start
-            if f.is_str:
-                end = data.index(b"\x00", off)
-                vals[f.name] = data[off:end].decode("utf-8", errors="replace")
-                off = end + 1
-            else:
-                vals[f.name] = struct.unpack_from("<" + f.fmt, data, off)[0]
-                off += f.nbytes
+            vals[f.name] = struct.unpack_from("<" + f.fmt, data, off)[0]
+            off += f.nbytes
         return vals, off
 
     def skip(self, data, pkt_start, offset):
         """Advance past this event without materializing field values."""
-        off = offset
-        for f in self.fields:
+        lay = self._layouts[(offset - pkt_start) & 7]
+        if lay.fixed_size is not None:
+            return offset + lay.fixed_size
+        off = data.find(b"\x00", offset + lay.prefix_size)
+        if off < 0:
+            raise ValueError("unterminated string field")
+        off += 1
+        for f in lay.tail_fields:
             off = align_up(off - pkt_start, f.align) + pkt_start
-            if f.is_str:
-                off = data.index(b"\x00", off) + 1
-            else:
-                off += f.nbytes
+            off += f.nbytes
         return off
 
 
@@ -557,35 +621,31 @@ def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
     cyc_end = cycle_range[1] if cycle_range else None
 
     file_size = os.path.getsize(stream_path)
+    if file_size == 0:
+        return
+
     with open(stream_path, "rb") as f:
-        CHUNK = 256 * 1024 * 1024  # 256MB
-        file_offset = 0
-        leftover = b""
-        abs_pos = 0
-        stopped = False
-
-        while file_offset < file_size and not stopped:
-            raw = f.read(CHUNK)
-            if not raw:
-                break
-            data = leftover + raw
-            file_offset += len(raw)
+        # mmap the whole stream: packets are walked in place with no chunk
+        # boundary handling and no per-chunk copy. struct.unpack_from / .find
+        # operate on the mapping directly.
+        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
             offset = 0
+            last_progress = 0
+            stopped = False
 
-            while offset + PKT_HDR.size + PKT_CTX.size < len(data):
+            while offset + PKT_OVERHEAD < file_size and not stopped:
                 magic, _stream_id = PKT_HDR.unpack_from(data, offset)
                 if magic != CTF_MAGIC:
                     offset += 1
                     continue
 
                 pkt_start = offset
-                pkt_size_bits = struct.unpack_from("<Q", data, offset + PKT_HDR.size)[0]
-                content_size_bits = struct.unpack_from("<Q", data, offset + PKT_HDR.size + 8)[0]
-                pkt_size = pkt_size_bits // 8
-                content_size = content_size_bits // 8
+                pkt_size = struct.unpack_from("<Q", data, offset + PKT_HDR.size)[0] // 8
+                content_size = struct.unpack_from("<Q", data, offset + PKT_HDR.size + 8)[0] // 8
 
-                if pkt_start + pkt_size > len(data):
-                    break  # incomplete packet — keep as leftover
+                if pkt_start + pkt_size > file_size:
+                    break  # truncated trailing packet
 
                 content_end = pkt_start + content_size
                 evt_offset = pkt_start + PKT_OVERHEAD
@@ -593,9 +653,12 @@ def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
                 # The packet header carries a timestamp_begin we could use to
                 # skip whole packets outside cycle_range, but cycles and CTF
                 # timestamps are not the same scale; rely on per-event filter.
-                while evt_offset + EVT_HDR.size <= content_end:
-                    evt_id, evt_ts = EVT_HDR.unpack_from(data, evt_offset)
-                    evt_offset += EVT_HDR.size
+                while evt_offset + EVT_HDR_SIZE <= content_end:
+                    evt_id = EVT_ID.unpack_from(data, evt_offset)[0]
+                    # event header is id(u64) + timestamp(u64); the timestamp is
+                    # only a cycle fallback (read lazily below) so skip past both.
+                    hdr_offset = evt_offset
+                    evt_offset += EVT_HDR_SIZE
 
                     et = schema.get(evt_id)
                     if et is None:
@@ -619,7 +682,9 @@ def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
 
                     cycle = vals.get("cycle")
                     if cycle is None:
-                        cycle = vals.get("timestamp", evt_ts)
+                        cycle = vals.get("timestamp")
+                        if cycle is None:  # neither field present — CTF header ts
+                            cycle = EVT_ID.unpack_from(data, hdr_offset + 8)[0]
                     if cyc_start is not None and cycle < cyc_start:
                         continue
                     if cyc_end is not None and cycle >= cyc_end:
@@ -631,17 +696,13 @@ def parse_ctf_stream(stream_path, want_ids=(2,), tile_filter=None,
                 offset = pkt_start + pkt_size
 
                 if progress is not None:
-                    new_abs = file_offset - len(data) + offset
-                    progress.update(new_abs - abs_pos)
-                    abs_pos = new_abs
+                    progress.update(offset - last_progress)
+                    last_progress = offset
 
-                if stopped:
-                    break
-
-            leftover = data[offset:]
-
-        if progress is not None:
-            progress.update(file_size - abs_pos)
+            if progress is not None and not stopped:
+                progress.update(file_size - last_progress)
+        finally:
+            data.close()
 
 
 # --------------------------------------------------------------------------- #
