@@ -49,9 +49,11 @@ class TileProfile:
 _WORKER = {}
 
 
-def _flame_init(metadata_path, tile_elf_mapping, elf_lookups, tile_filter):
+def _flame_init(metadata_path, tile_elf_mapping, elf_lookups, tile_filter,
+                coroutine_stacks):
     _WORKER.update(metadata_path=metadata_path, mapping=tile_elf_mapping,
-                   lookups=elf_lookups, tile_filter=tile_filter)
+                   lookups=elf_lookups, tile_filter=tile_filter,
+                   coroutine_stacks=coroutine_stacks)
 
 
 def _flame_worker(path):
@@ -78,7 +80,8 @@ def _flame_worker(path):
                               tile_filter=_WORKER["tile_filter"],
                               metadata_path=_WORKER["metadata_path"])
     for kind, tile_idx, label, cycle in reconstruct(
-            events, _WORKER["mapping"], _WORKER["lookups"], stats=stats):
+            events, _WORKER["mapping"], _WORKER["lookups"], stats=stats,
+            coroutine_stacks=_WORKER["coroutine_stacks"]):
         t = tiles.get(tile_idx)
         if t is None:
             t = tiles[tile_idx] = [cycle, cycle, []]
@@ -88,7 +91,7 @@ def _flame_worker(path):
 
 
 def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
-                     grid_width=12, jobs=None):
+                     grid_width=12, jobs=None, coroutine_stacks=True):
     """Process the full trace and build a speedscope JSON structure.
 
     Call-stack reconstruction is per-tile and each tile lives in exactly one
@@ -114,7 +117,8 @@ def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
     stats = Counter()
     for _path, (local_frames, local_tiles, local_stats) in parallel_streams(
             paths, _flame_worker, jobs=jobs, initializer=_flame_init,
-            initargs=(metadata_path, tile_elf_mapping, elf_lookups, tile_filter)):
+            initargs=(metadata_path, tile_elf_mapping, elf_lookups, tile_filter,
+                      coroutine_stacks)):
         remap = [get_frame_idx(n) for n in local_frames]
         for tile_idx, (first, last, evs) in local_tiles.items():
             prof = tiles.get(tile_idx)
@@ -131,7 +135,8 @@ def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
 
     print(f"  Events: {stats['events']}  calls: {stats['calls']}  "
           f"returns: {stats['returns']}  task switches: {stats['task_switches']}  "
-          f"task terminations: {stats['task_terms']}", file=sys.stderr)
+          f"task terminations: {stats['task_terms']}  "
+          f"coroutine resumes: {stats['coroutine_resumes']}", file=sys.stderr)
 
     profiles = []
     for tile_idx in sorted(tiles.keys()):
@@ -180,6 +185,12 @@ def main():
                              "(plus optional east/, west/)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print per-file details")
+    parser.add_argument("--coroutine-stacks",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Re-establish the call stack of a coroutine resumed "
+                             "by a stack-switching runtime (requires the TU "
+                             "Darmstadt CSL coroutine transpiler; no effect on "
+                             "other programs)")
     parser.add_argument("-j", "--jobs", type=int, default=None,
                         help="Parallel worker processes (default: one per "
                              "stream, capped at the CPU count; 1 = serial)")
@@ -210,7 +221,8 @@ def main():
 
     speedscope = build_speedscope(
         trace_dir, tile_elf_mapping, elf_lookups,
-        tile_filter=tile_filter, grid_width=grid_width, jobs=args.jobs
+        tile_filter=tile_filter, grid_width=grid_width, jobs=args.jobs,
+        coroutine_stacks=args.coroutine_stacks,
     )
 
     with open(args.output, "w") as f:

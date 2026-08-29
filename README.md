@@ -151,6 +151,9 @@ offsets. The simulator emits these event types (not all appear in every trace):
 - **id 3** (pipe) emits several records per instruction, one per pipeline stage; only **stage 6** (writeback) carries resolved operand values (`dest`, `src0`, `src1`, `src2`) — earlier stages are `0xFFFFFFFF` sentinels. `uid` links a pipe record back to its dispatch.
 - **wavelets** come as either id 5 (`wavelet_entry`) or id 6 (`wavelet_trace_entry`) depending on the simulator build; `simperfetto` handles both, while `simtrace wavelets` covers id 5.
 
+## Coroutine-enabled CSL
+Vanilla CSL has no coroutines: a task runs to its termination, and the next activation of that task re-enters it at its entry point. The transpiler developed at TU Darmstadt adds support for coroutines to CSL, significantly simplifying  programming the WSE. Its stackful backend gives each `async task` its own stack. Users can suspend the current task with `@suspend()`, which spills registers,  saves the stack pointer and resume address and terminates the current task. When the task is resumed, the stack and registers are restored and the program  continues after the `@suspend()` call as usual. The transpiler and the extended  language standard are expected to be released soon. 
+
 ## Notes
 
 - Instruction pointers in the trace are **word addresses** (1 word = 2 bytes). `simtrace` multiplies by 2 when looking up the byte address used by llvm-objdump / ELF symbols.

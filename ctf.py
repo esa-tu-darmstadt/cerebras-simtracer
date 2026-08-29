@@ -28,17 +28,33 @@ CTF_MAGIC = 0xC1FC1FC1
 
 @dataclass(frozen=True)
 class WSEArch:
-    """Architecture-specific constants for a WSE generation."""
+    """Architecture-specific constants for a WSE generation.
+
+    The jump encodings below are used to classify control transfers during
+    call-stack reconstruction. `jmp <reg>` shares an opcode across all
+    registers and differs only in the register field, so the register-indirect
+    form is matched with a mask that clears that field; `jmp r15` is then the
+    one member of that family that denotes a function return.
+    """
     version: int
     name: str
     jmp_r15: int       # encoding of `jmp r15` (function return)
     jmp_r15_mask: int  # mask to apply to inst_bin before comparing
+    jmp_reg: int       # encoding of `jmp <reg>` with the register field cleared
+    jmp_reg_mask: int  # mask that clears the register field
 
 
 # ELF e_flags -> WSE generation: 0x0=WSE1, 0x1=WSE2, 0x2=WSE3
+#
+# WSE2 encodes the jump register in bits [14:11] (`jmp r15` = 0x7c6f,
+# `jmp r8` = 0x446f); WSE3 encodes it in bits [9:6] (`jmp r15` = 0x6d8003c0,
+# `jmp r8` = 0x6d800200). Both were read off dispatch traces whose mnemonic
+# field the simulator reports as JMP.
 WSE_ARCHS = {
-    0x1: WSEArch(version=2, name="neumann",     jmp_r15=0x7C6F,     jmp_r15_mask=0xFFFF),      # 6f 7c
-    0x2: WSEArch(version=3, name="schrödinger", jmp_r15=0x6D8003C0, jmp_r15_mask=0xFFFFFFFF),  # c0 03 80 6d
+    0x1: WSEArch(version=2, name="neumann",     jmp_r15=0x7C6F,     jmp_r15_mask=0xFFFF,
+                 jmp_reg=0x046F,     jmp_reg_mask=0x87FF),
+    0x2: WSEArch(version=3, name="schrödinger", jmp_r15=0x6D8003C0, jmp_r15_mask=0xFFFFFFFF,
+                 jmp_reg=0x6D800000, jmp_reg_mask=0xFFFFFC3F),
 }
 
 # Pipeline stage where dest/src operand values are resolved.
