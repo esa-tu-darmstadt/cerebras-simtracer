@@ -117,6 +117,9 @@ def _resumed_frames(state, prev_inst_bin, func_name, is_entry, evt, arch):
 @dataclass
 class _TileState:
     call_stack: list = field(default_factory=list)
+    # Logical frames nested inside call_stack[-1]. They come from DWARF and
+    # never participate in physical call/return or coroutine-resume state.
+    inline_stack: list = field(default_factory=list)
     prev_func: str = None
     prev_inst_bin: int = 0
     current_task: int = -1
@@ -128,7 +131,7 @@ class _TileState:
 
 
 def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
-                coroutine_stacks=True):
+                coroutine_stacks=True, inline_frames=False):
     """Yield ``(kind, tile_index, label, cycle)`` frame open/close events.
 
     Args:
@@ -137,11 +140,15 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
         elf_lookups: elf_path -> SymbolLookup.
         stats: optional Counter, populated in place with counts for keys
             ``events``, ``calls``, ``returns``, ``task_switches``,
-            ``task_terms``, ``coroutine_resumes`` (useful for a one-line
-            summary).
+            ``task_terms``, ``coroutine_resumes``, and ``inline_opens``
+            (useful for a one-line summary).
         coroutine_stacks: when False, do not re-establish the stacks of
             coroutines resumed by a stack-switching runtime. Traces from
             programs without such a runtime are unaffected either way.
+        inline_frames: when True, expand the top physical function with the
+            DWARF inline chain at each instruction pointer. Inline scopes are
+            reporting frames only: physical calls, returns, task switches and
+            coroutine resumes continue to use the ELF symbol table alone.
     """
     if stats is None:
         stats = Counter()
@@ -152,6 +159,33 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
         if st is None:
             st = states[tile_idx] = _TileState()
         return st
+
+    def close_inline(state, tile_idx, cycle):
+        while state.inline_stack:
+            yield ("C", tile_idx, state.inline_stack.pop(), cycle)
+
+    def sync_inline(state, lookup, func_name, byte_addr, tile_idx, cycle):
+        if not inline_frames or not state.call_stack:
+            desired = []
+        else:
+            chain = lookup.inline_chain(byte_addr)
+            # inline_chain normally begins with the physical function. If a
+            # linker thunk/padding mismatch made it explicit twice, only the
+            # portion below the current physical frame is logical nesting.
+            desired = list(chain[1:] if chain and chain[0] == func_name
+                           else chain)
+
+        common = 0
+        limit = min(len(state.inline_stack), len(desired))
+        while (common < limit
+               and state.inline_stack[common] == desired[common]):
+            common += 1
+        while len(state.inline_stack) > common:
+            yield ("C", tile_idx, state.inline_stack.pop(), cycle)
+        for name in desired[common:]:
+            state.inline_stack.append(name)
+            stats["inline_opens"] += 1
+            yield ("O", tile_idx, name, cycle)
 
     for evt in events:
         tile_idx = evt.tile_index
@@ -181,6 +215,7 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
         # Task frame management
         if evt.task_color != state.current_task:
             stats["task_switches"] += 1
+            yield from close_inline(state, tile_idx, evt.cycle)
             for fn in reversed(state.call_stack):
                 yield ("C", tile_idx, fn, evt.cycle)
             state.call_stack.clear()
@@ -198,6 +233,7 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
             if state.call_stack and state.current_task >= 0:
                 state.suspended[state.current_task] = (
                     list(state.call_stack), evt.inst_ptr)
+            yield from close_inline(state, tile_idx, evt.cycle)
             for fn in reversed(state.call_stack):
                 yield ("C", tile_idx, fn, evt.cycle)
             state.call_stack.clear()
@@ -217,16 +253,20 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
                 # The runtime frames that performed the switch run on the
                 # scheduler's stack and are abandoned by the jump, so they end
                 # here rather than enclosing the resumed call chain.
+                yield from close_inline(state, tile_idx, evt.cycle)
                 for fn in reversed(state.call_stack):
                     yield ("C", tile_idx, fn, evt.cycle)
                 state.call_stack = resumed
                 for fn in state.call_stack:
                     yield ("O", tile_idx, fn, evt.cycle)
                 state.prev_func = func_name
+                yield from sync_inline(state, lookup, func_name,
+                                       evt.inst_ptr * 2, tile_idx, evt.cycle)
                 continue
 
         if evt.inst_bin & arch.jmp_r15_mask == arch.jmp_r15:
             stats["returns"] += 1
+            yield from close_inline(state, tile_idx, evt.cycle)
             if state.call_stack:
                 top = state.call_stack[-1]
                 yield ("C", tile_idx, top, evt.cycle)
@@ -235,6 +275,7 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
             continue
 
         if func_name != state.prev_func:
+            yield from close_inline(state, tile_idx, evt.cycle)
             if is_entry and state.prev_func is not None:
                 stats["calls"] += 1
                 state.call_stack.append(func_name)
@@ -253,10 +294,13 @@ def reconstruct(events, tile_elf_mapping, elf_lookups, stats=None,
                 state.call_stack.append(func_name)
                 yield ("O", tile_idx, func_name, evt.cycle)
 
+        yield from sync_inline(state, lookup, func_name, evt.inst_ptr * 2,
+                               tile_idx, evt.cycle)
         state.prev_func = func_name
 
     # Flush any frames still open at end of trace.
     for tile_idx, state in states.items():
+        yield from close_inline(state, tile_idx, state.last_cycle)
         for fn in reversed(state.call_stack):
             yield ("C", tile_idx, fn, state.last_cycle)
         state.call_stack.clear()

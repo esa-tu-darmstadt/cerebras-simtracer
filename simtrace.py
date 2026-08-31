@@ -235,7 +235,8 @@ def setup_context(args):
     except FileNotFoundError as e:
         raise SystemExit(str(e))
     grid_width, grid_height = read_grid_dims(trace_dir)
-    elf_lookups, _arch = load_all_elf_lookups(bin_root, verbose=args.verbose)
+    elf_lookups, _arch = load_all_elf_lookups(
+        bin_root, verbose=args.verbose, with_dwarf=args.inline)
     if not elf_lookups:
         raise SystemExit("No ELF files with function symbols found")
     tile_elf_mapping = build_elf_mapping(elf_lookups, grid_width,
@@ -315,6 +316,17 @@ def _fmt_pipe_operands(pe):
     return " ".join(parts)
 
 
+def _function_chain(lookup, byte_addr, show_inline):
+    """Names to display/attribute for an address under the selected mode."""
+    if show_inline:
+        return lookup.inline_chain(byte_addr)
+    return (lookup.lookup(byte_addr)[0],)
+
+
+def _function_label(chain):
+    return " > ".join(chain)
+
+
 def cmd_show(args, ctx):
     tile = resolve_tile(args.tile, ctx.grid_width)
     cyc_range = parse_cycle_range(args.cycles)
@@ -345,8 +357,11 @@ def cmd_show(args, ctx):
     n_emitted = 0
     last_func = None
     for evt in trace.dispatch:
-        fn, is_entry = lookup.lookup(evt.inst_ptr * 2)
-        if keep is not None and not keep(fn):
+        addr = evt.inst_ptr * 2
+        _, is_entry = lookup.lookup(addr)
+        chain = _function_chain(lookup, addr, args.inline)
+        fn = _function_label(chain)
+        if keep is not None and not any(keep(name) for name in chain):
             continue
 
         # Show function header line when function changes (callsite hint)
@@ -354,8 +369,8 @@ def cmd_show(args, ctx):
             print(f"  --- {fn} ---")
             last_func = fn
 
-        dl = disasm.lookup(evt.inst_ptr * 2) if disasm else None
-        ip_str = f"0x{evt.inst_ptr * 2:08x}"
+        dl = disasm.lookup(addr) if disasm else None
+        ip_str = f"0x{addr:08x}"
         flags = ("E" if is_entry else " ") + ("T" if evt.term_op == 1 else " ")
         inst_bin_str = f"0x{evt.inst_bin:08x}"
         asm_str = dl.asm if dl else "—"
@@ -450,7 +465,8 @@ def cmd_stats(args, ctx):
     by_task_terms = Counter()
     for evt in trace.dispatch:
         by_task[evt.task_color] += 1
-        fn, _ = lookup.lookup(evt.inst_ptr * 2)
+        chain = _function_chain(lookup, evt.inst_ptr * 2, args.inline)
+        fn = chain[-1]
         by_func[fn] += 1
         by_mnemonic[evt.name] += 1
         if evt.term_op == 1:
@@ -523,7 +539,8 @@ def cmd_regs(args, ctx):
                                  pe.src1 == PIPE_NO_VALUE_U32 and
                                  pe.src2 == PIPE_NO_VALUE_U32):
             continue
-        fn, _ = lookup.lookup(evt.inst_ptr * 2)
+        chain = _function_chain(lookup, evt.inst_ptr * 2, args.inline)
+        fn = _function_label(chain)
         dl = disasm.lookup(evt.inst_ptr * 2) if disasm else None
         asm = dl.asm if dl else ""
         print(f"{evt.cycle:>8}  0x{evt.inst_ptr*2:06x}  {evt.name:<10}  "
@@ -586,6 +603,14 @@ def cmd_funcs(args, ctx):
     for f in matches:
         print(f"  0x{f.start:06x}  {f.size:>6}  {f.name}")
     print(f"({len(matches)} function(s))", file=sys.stderr)
+    if args.inline and lookup.dwarf is not None:
+        names = sorted(name for name in lookup.dwarf.names
+                       if pat is None or pat in name
+                       or fnmatch.fnmatchcase(name, pat))
+        print("\nDWARF inline functions:")
+        for name in names:
+            print(f"  {name}")
+        print(f"({len(names)} inline function(s))", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -702,6 +727,9 @@ def build_argparser():
                         help="Path to llvm-objdump (Cerebras toolchain). When "
                              "omitted, the disassembly column is left empty "
                              "and the trace's own mnemonic + inst_bin are used.")
+    parser.add_argument("--inline", action="store_true",
+                        help="load DWARF and show LLVM-inlined function scopes; "
+                             "physical entry/return detection is unchanged")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 

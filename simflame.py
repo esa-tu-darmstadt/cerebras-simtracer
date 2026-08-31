@@ -50,10 +50,11 @@ _WORKER = {}
 
 
 def _flame_init(metadata_path, tile_elf_mapping, elf_lookups, tile_filter,
-                coroutine_stacks):
+                coroutine_stacks, inline_frames):
     _WORKER.update(metadata_path=metadata_path, mapping=tile_elf_mapping,
                    lookups=elf_lookups, tile_filter=tile_filter,
-                   coroutine_stacks=coroutine_stacks)
+                   coroutine_stacks=coroutine_stacks,
+                   inline_frames=inline_frames)
 
 
 def _flame_worker(path):
@@ -81,7 +82,8 @@ def _flame_worker(path):
                               metadata_path=_WORKER["metadata_path"])
     for kind, tile_idx, label, cycle in reconstruct(
             events, _WORKER["mapping"], _WORKER["lookups"], stats=stats,
-            coroutine_stacks=_WORKER["coroutine_stacks"]):
+            coroutine_stacks=_WORKER["coroutine_stacks"],
+            inline_frames=_WORKER["inline_frames"]):
         t = tiles.get(tile_idx)
         if t is None:
             t = tiles[tile_idx] = [cycle, cycle, []]
@@ -91,7 +93,8 @@ def _flame_worker(path):
 
 
 def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
-                     grid_width=12, jobs=None, coroutine_stacks=True):
+                     grid_width=12, jobs=None, coroutine_stacks=True,
+                     inline_frames=False):
     """Process the full trace and build a speedscope JSON structure.
 
     Call-stack reconstruction is per-tile and each tile lives in exactly one
@@ -118,7 +121,7 @@ def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
     for _path, (local_frames, local_tiles, local_stats) in parallel_streams(
             paths, _flame_worker, jobs=jobs, initializer=_flame_init,
             initargs=(metadata_path, tile_elf_mapping, elf_lookups, tile_filter,
-                      coroutine_stacks)):
+                      coroutine_stacks, inline_frames)):
         remap = [get_frame_idx(n) for n in local_frames]
         for tile_idx, (first, last, evs) in local_tiles.items():
             prof = tiles.get(tile_idx)
@@ -133,10 +136,14 @@ def build_speedscope(trace_dir, tile_elf_mapping, elf_lookups, tile_filter=None,
 
     pbar.close()
 
-    print(f"  Events: {stats['events']}  calls: {stats['calls']}  "
-          f"returns: {stats['returns']}  task switches: {stats['task_switches']}  "
-          f"task terminations: {stats['task_terms']}  "
-          f"coroutine resumes: {stats['coroutine_resumes']}", file=sys.stderr)
+    summary = (f"  Events: {stats['events']}  calls: {stats['calls']}  "
+               f"returns: {stats['returns']}  "
+               f"task switches: {stats['task_switches']}  "
+               f"task terminations: {stats['task_terms']}  "
+               f"coroutine resumes: {stats['coroutine_resumes']}")
+    if inline_frames:
+        summary += f"  inline opens: {stats['inline_opens']}"
+    print(summary, file=sys.stderr)
 
     profiles = []
     for tile_idx in sorted(tiles.keys()):
@@ -191,6 +198,10 @@ def main():
                              "by a stack-switching runtime (requires the TU "
                              "Darmstadt CSL coroutine transpiler; no effect on "
                              "other programs)")
+    parser.add_argument("--inline", action="store_true",
+                        help="expand LLVM-inlined functions from DWARF in the "
+                             "flamegraph; physical stack reconstruction is "
+                             "unchanged")
     parser.add_argument("-j", "--jobs", type=int, default=None,
                         help="Parallel worker processes (default: one per "
                              "stream, capped at the CPU count; 1 = serial)")
@@ -209,7 +220,8 @@ def main():
     if args.tiles:
         tile_filter = set(int(t.strip()) for t in args.tiles.split(","))
 
-    elf_lookups, detected_arch = load_all_elf_lookups(bin_root, verbose=verbose)
+    elf_lookups, detected_arch = load_all_elf_lookups(
+        bin_root, verbose=verbose, with_dwarf=args.inline)
     if not elf_lookups:
         print("Error: No ELF files with function symbols found", file=sys.stderr)
         sys.exit(1)
@@ -222,7 +234,7 @@ def main():
     speedscope = build_speedscope(
         trace_dir, tile_elf_mapping, elf_lookups,
         tile_filter=tile_filter, grid_width=grid_width, jobs=args.jobs,
-        coroutine_stacks=args.coroutine_stacks,
+        coroutine_stacks=args.coroutine_stacks, inline_frames=args.inline,
     )
 
     with open(args.output, "w") as f:

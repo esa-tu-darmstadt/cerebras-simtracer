@@ -16,6 +16,8 @@ import struct
 import sys
 from dataclasses import dataclass
 
+from elftools.dwarf.descriptions import describe_form_class
+from elftools.dwarf.ranges import BaseAddressEntry
 from elftools.elf.elffile import ELFFile
 
 
@@ -102,6 +104,144 @@ class Function:
         return self.start + self.size
 
 
+@dataclass(frozen=True)
+class InlineRange:
+    """A half-open address interval and its outermost-to-innermost scopes."""
+
+    start: int
+    end: int
+    chain: tuple
+
+
+def _die_name(die):
+    """Return a DIE's linkage/name, following abstract origins as needed."""
+    seen = set()
+    while die is not None and die.offset not in seen:
+        seen.add(die.offset)
+        attrs = die.attributes
+        attr = attrs.get("DW_AT_linkage_name") or attrs.get("DW_AT_name")
+        if attr is not None:
+            value = attr.value
+            return (value.decode(errors="replace")
+                    if isinstance(value, bytes) else str(value))
+        ref = ("DW_AT_abstract_origin"
+               if "DW_AT_abstract_origin" in attrs else
+               "DW_AT_specification"
+               if "DW_AT_specification" in attrs else None)
+        die = die.get_DIE_from_attribute(ref) if ref is not None else None
+    return None
+
+
+def _die_ranges(die, dwarf_info):
+    """Return the absolute half-open PC ranges described by ``die``."""
+    attrs = die.attributes
+    low = attrs.get("DW_AT_low_pc")
+    high = attrs.get("DW_AT_high_pc")
+    if low is not None and high is not None:
+        end = high.value
+        if describe_form_class(high.form) == "constant":
+            end += low.value
+        return [(low.value, end)]
+
+    ranges_attr = attrs.get("DW_AT_ranges")
+    if ranges_attr is None:
+        return []
+    range_lists = dwarf_info.range_lists()
+    if range_lists is None:
+        return []
+
+    cu = die.cu
+    top_low = cu.get_top_DIE().attributes.get("DW_AT_low_pc")
+    base = top_low.value if top_low is not None else 0
+    out = []
+    for entry in range_lists.get_range_list_at_offset(ranges_attr.value, cu):
+        if isinstance(entry, BaseAddressEntry):
+            base = entry.base_address
+            continue
+        if entry.is_absolute:
+            out.append((entry.begin_offset, entry.end_offset))
+        else:
+            out.append((base + entry.begin_offset, base + entry.end_offset))
+    return out
+
+
+class DwarfInlineLookup:
+    """Fast byte-address lookup for DWARF inline-scope chains.
+
+    DWARF ranges nest and can be discontiguous.  The constructor flattens
+    those overlaps into non-overlapping segments whose value is the deepest
+    chain active over that segment, keeping lookup to one binary search.
+    """
+
+    def __init__(self, elf):
+        self.ranges = []
+        self.starts = []
+        self.names = set()
+        if not elf.has_dwarf_info():
+            return
+
+        dwarf_info = elf.get_dwarf_info()
+        raw_ranges = []
+        for cu in dwarf_info.iter_CUs():
+            self._walk(cu.get_top_DIE(), (), dwarf_info, raw_ranges)
+        self._flatten(raw_ranges)
+
+    def _walk(self, die, parent_chain, dwarf_info, raw_ranges):
+        chain = parent_chain
+        ranges = _die_ranges(die, dwarf_info)
+        if die.tag == "DW_TAG_subprogram" and ranges:
+            name = _die_name(die)
+            if name:
+                chain = parent_chain + (name,)
+        elif die.tag == "DW_TAG_inlined_subroutine":
+            name = _die_name(die)
+            if name:
+                chain = parent_chain + (name,)
+                self.names.add(name)
+                for start, end in ranges:
+                    if start < end:
+                        raw_ranges.append((start, end, chain))
+
+        for child in die.iter_children():
+            self._walk(child, chain, dwarf_info, raw_ranges)
+
+    def _flatten(self, raw_ranges):
+        changes = {}
+        for ident, (start, end, chain) in enumerate(raw_ranges):
+            changes.setdefault(start, [[], []])[1].append((ident, chain))
+            changes.setdefault(end, [[], []])[0].append(ident)
+
+        active = {}
+        previous = None
+        segments = []
+        for address in sorted(changes):
+            if previous is not None and previous < address and active:
+                chain = max(active.values(), key=len)
+                if segments and segments[-1].end == previous \
+                        and segments[-1].chain == chain:
+                    segments[-1] = InlineRange(segments[-1].start, address,
+                                               chain)
+                else:
+                    segments.append(InlineRange(previous, address, chain))
+            removes, adds = changes[address]
+            for ident in removes:
+                active.pop(ident, None)
+            for ident, chain in adds:
+                active[ident] = chain
+            previous = address
+
+        self.ranges = segments
+        self.starts = [entry.start for entry in segments]
+
+    def lookup(self, address):
+        """Return the inline chain covering ``address``, or an empty tuple."""
+        index = bisect.bisect_right(self.starts, address) - 1
+        if index < 0:
+            return ()
+        entry = self.ranges[index]
+        return entry.chain if address < entry.end else ()
+
+
 def parse_elf_symbols(elf_path):
     """Parse function symbols from an ELF file using pyelftools.
 
@@ -148,6 +288,12 @@ class SymbolLookup:
         for i, f in enumerate(functions):
             end = functions[i + 1].start if i + 1 < len(functions) else f.end
             self._extended.append((f.start, end, f.name))
+        self.dwarf = None
+
+    def load_dwarf(self, elf_path):
+        """Load optional inline-scope information from ``elf_path``."""
+        with open(elf_path, "rb") as f:
+            self.dwarf = DwarfInlineLookup(ELFFile(f))
 
     def lookup(self, addr):
         """Return (function_name, is_entry_point) or ('<init>', False) if before first function."""
@@ -169,6 +315,24 @@ class SymbolLookup:
         if f.start <= addr < f.end:
             return f.name, (addr == f.start)
         return None, False
+
+    def inline_chain(self, addr):
+        """Return the source function chain at ``addr``, outermost first.
+
+        The first element is the physical function and later elements are
+        DWARF inline scopes.  With no applicable DWARF range this deliberately
+        reduces to the existing physical symbol lookup.
+        """
+        physical, _ = self.lookup(addr)
+        if self.dwarf is None:
+            return (physical,)
+        chain = self.dwarf.lookup(addr)
+        if not chain:
+            return (physical,)
+        # Normally the concrete DW_TAG_subprogram is the physical symbol.  A
+        # mismatch can occur in linker padding or a thunk; retaining the
+        # symbol-table answer makes the physical/inline boundary explicit.
+        return chain if chain[0] == physical else (physical,) + chain
 
     def find_by_pattern(self, pattern):
         """Return list of Functions whose name contains pattern (substring match)."""
@@ -259,9 +423,10 @@ def resolve_bin_root(out_dir, override=None):
     )
 
 
-def load_all_elf_lookups(bin_root, verbose=False):
+def load_all_elf_lookups(bin_root, verbose=False, with_dwarf=False):
     """Load SymbolLookup for every ELF under bin_root/{bin,west/bin,east/bin}.
 
+    Set ``with_dwarf`` to index inline scopes in addition to physical symbols.
     Returns (elf_lookups dict {path: SymbolLookup}, detected_arch).
     """
     bin_dir = os.path.join(bin_root, "bin")
@@ -283,10 +448,15 @@ def load_all_elf_lookups(bin_root, verbose=False):
             functions, arch = parse_elf_symbols(elf_path)
             if functions:
                 detected_arch = arch
-                elf_lookups[elf_path] = SymbolLookup(functions, arch)
+                lookup = SymbolLookup(functions, arch)
+                if with_dwarf:
+                    lookup.load_dwarf(elf_path)
+                elf_lookups[elf_path] = lookup
                 if verbose:
-                    print(f"  {rel}/{elf_file}: {len(functions)} functions "
-                          f"(WSE{arch.version})", file=sys.stderr)
+                    inline = (f", {len(lookup.dwarf.names)} inlined"
+                              if lookup.dwarf is not None else "")
+                    print(f"  {rel}/{elf_file}: {len(functions)} functions"
+                          f"{inline} (WSE{arch.version})", file=sys.stderr)
     return elf_lookups, detected_arch
 
 

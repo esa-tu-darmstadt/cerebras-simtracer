@@ -89,6 +89,9 @@ class Channels:
     # Re-establish the stacks of coroutines resumed by a stack-switching
     # runtime. Traces without such a runtime are unaffected either way.
     coroutine_stacks: bool = True
+    # Add DWARF inline scopes to the visible calls track. Physical stack
+    # reconstruction remains symbol-table based.
+    inline_frames: bool = False
 
     @property
     def want_wavelets(self):
@@ -346,7 +349,8 @@ def emit_stream(writer, base_iter, *, grid_width, channels, bin_cycles,
     if channels.calls:
         for kind, tile_idx, label, cycle in reconstruct(
                 dispatch_stream(), tile_elf_mapping, elf_lookups,
-                coroutine_stacks=channels.coroutine_stacks):
+                coroutine_stacks=channels.coroutine_stacks,
+                inline_frames=channels.inline_frames):
             emitter_for(tile_idx).emit_slice(kind, label, cycle)
     else:
         for _ in dispatch_stream():
@@ -495,6 +499,9 @@ def build_argparser():
                    help="Re-establish the call stack of a coroutine resumed by a "
                         "stack-switching runtime (requires the TU Darmstadt CSL "
                         "coroutine transpiler; no effect on other programs)")
+    g.add_argument("--inline", action="store_true",
+                   help="expand LLVM-inlined functions from DWARF on the calls "
+                        "track; physical stack reconstruction is unchanged")
     g.add_argument("--flow", action=argparse.BooleanOptionalAction, default=True,
                    help="Wavelet flow arrows linking a wavelet's hops by ident "
                         "(default: on; needs --wavelet-events)")
@@ -534,6 +541,7 @@ def main():
         debug_counters=args.debug_counters or args.all,
         flow=args.flow or args.all,
         coroutine_stacks=args.coroutine_stacks,
+        inline_frames=args.inline,
     )
 
     try:
@@ -543,7 +551,8 @@ def main():
         raise SystemExit(f"Error: {e}")
 
     grid_width, grid_height = read_grid_dims(trace_dir)
-    elf_lookups, detected_arch = load_all_elf_lookups(bin_root, verbose=args.verbose)
+    elf_lookups, detected_arch = load_all_elf_lookups(
+        bin_root, verbose=args.verbose, with_dwarf=args.inline)
     if not elf_lookups:
         raise SystemExit("Error: No ELF files with function symbols found")
     if not args.quiet:
